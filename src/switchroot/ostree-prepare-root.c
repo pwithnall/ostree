@@ -174,15 +174,19 @@ main(int argc, char *argv[])
   struct stat stbuf;
   int we_mounted_proc = 0;
   const char *ostree_target;
+  const char * const *init_args;
 
-  /* Usage: ostree-prepare-root [root-mount-point [ostree-target]] */
+  /* Usage: ostree-prepare-root [root-mount-point [ostree-target [init-path arg1 …]]] */
   root_arg = "/";
   ostree_target = NULL;
+  init_args = NULL;
 
   if (argc >= 2)
     root_arg = argv[1];
   if (argc >= 3)
     ostree_target = argv[2];
+  if (argc >= 4)
+    init_args = (const char * const *) argv + 3;
 
   if (!ostree_target && stat ("/proc/cmdline", &stbuf) < 0)
     {
@@ -314,8 +318,13 @@ main(int argc, char *argv[])
 
   if (getpid() == 1)
     {
-      execl ("/sbin/init", "/sbin/init", NULL);
-      err (EXIT_FAILURE, "failed to exec init inside ostree");
+      const char * const sbin_init_args[] = { "/sbin/init", NULL };
+
+      if (init_args == NULL)
+        init_args = sbin_init_args;
+
+      execv (init_args[0], (char * const *) init_args);
+      err (EXIT_FAILURE, "failed to exec %s inside ostree", init_args[0]);
     }
   else
     {
