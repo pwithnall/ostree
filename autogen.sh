@@ -1,9 +1,10 @@
 #!/bin/sh
 
-test -n "$srcdir" || srcdir=`dirname "$0"`
+test -n "$srcdir" || srcdir=$(dirname "$0")
 test -n "$srcdir" || srcdir=.
 
-olddir=`pwd`
+olddir=$(pwd)
+
 cd $srcdir
 
 AUTORECONF=`which autoreconf`
@@ -28,7 +29,6 @@ else
         gtkdocize
 fi
 
-cd $olddir
 if ! test -f libglnx/README.md || ! test -f bsdiff/README.md; then
     git submodule update --init
 fi
@@ -41,4 +41,5 @@ ln -sf ../libglnx/libglnx.m4 buildutil/libglnx.m4
 
 autoreconf --force --install --verbose
 
+cd "$olddir"
 test -n "$NOCONFIGURE" || "$srcdir/configure" "$@"
