@@ -126,15 +126,22 @@ touch_run_ostree (void)
 }
 
 static char*
-resolve_deploy_path (const char * root_mountpoint)
+resolve_deploy_path (const char * root_mountpoint, const char * ostree_target)
 {
   char destpath[PATH_MAX];
   struct stat stbuf;
-  char *ostree_target, *deploy_path;
+  char *ostree_target_allocated = NULL, *deploy_path;
 
-  ostree_target = parse_ostree_cmdline ();
   if (!ostree_target)
-    errx (EXIT_FAILURE, "No OSTree target; expected ostree=/ostree/boot.N/...");
+    {
+      ostree_target = ostree_target_allocated = parse_ostree_cmdline ();
+      if (!ostree_target)
+        errx (EXIT_FAILURE, "No OSTree target; expected ostree=/ostree/boot.N/...");
+    }
+  else
+    {
+      printf ("Using provided OSTree target %s\n", ostree_target);
+    }
 
   snprintf (destpath, sizeof(destpath), "%s/%s", root_mountpoint, ostree_target);
   printf ("Examining %s\n", destpath);
@@ -146,6 +153,9 @@ resolve_deploy_path (const char * root_mountpoint)
   if (deploy_path == NULL)
     err (EXIT_FAILURE, "realpath(%s) failed", destpath);
   printf ("Resolved OSTree target to: %s\n", deploy_path);
+
+  free (ostree_target_allocated);
+
   return deploy_path;
 }
 
@@ -163,13 +173,18 @@ main(int argc, char *argv[])
   char srcpath[PATH_MAX];
   struct stat stbuf;
   int we_mounted_proc = 0;
+  const char *ostree_target;
 
-  if (argc < 2)
-    root_arg = "/";
-  else
+  /* Usage: ostree-prepare-root [root-mount-point [ostree-target]] */
+  root_arg = "/";
+  ostree_target = NULL;
+
+  if (argc >= 2)
     root_arg = argv[1];
+  if (argc >= 3)
+    ostree_target = argv[2];
 
-  if (stat ("/proc/cmdline", &stbuf) < 0)
+  if (!ostree_target && stat ("/proc/cmdline", &stbuf) < 0)
     {
       if (errno != ENOENT)
         err (EXIT_FAILURE, "stat(\"/proc/cmdline\") failed");
@@ -183,7 +198,7 @@ main(int argc, char *argv[])
   root_mountpoint = realpath (root_arg, NULL);
   if (root_mountpoint == NULL)
     err (EXIT_FAILURE, "realpath(\"%s\")", root_arg);
-  deploy_path = resolve_deploy_path (root_mountpoint);
+  deploy_path = resolve_deploy_path (root_mountpoint, ostree_target);
 
   if (we_mounted_proc)
     {
