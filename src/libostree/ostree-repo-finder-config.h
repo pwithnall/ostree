@@ -1,4 +1,5 @@
-/*
+/* -*- mode: C; c-file-style: "gnu"; indent-tabs-mode: nil; -*-
+ *
  * Copyright © 2017 Endless Mobile, Inc.
  *
  * This library is free software; you can redistribute it and/or
@@ -20,26 +21,24 @@
  *  - Philip Withnall <withnall@endlessm.com>
  */
 
-/* Symbols in this file are added to the build if OSTree is configured with
- * --enable-experimental-api. They are not stable or officially supported, and
- * might disappear or change in future releases. */
+#pragma once
 
-LIBOSTREE_2017.6_EXPERIMENTAL {
-global:
-  ostree_remote_ref;
-  ostree_remote_unref;
-  ostree_repo_find_remotes_async;
-  ostree_repo_find_remotes_finish;
-  ostree_repo_finder_config_get_type;
-  ostree_repo_finder_config_new;
-  ostree_repo_finder_get_type;
-  ostree_repo_finder_resolve_async;
-  ostree_repo_finder_resolve_all_async;
-  ostree_repo_finder_resolve_all_finish;
-  ostree_repo_finder_resolve_finish;
-  ostree_repo_finder_result_compare;
-  ostree_repo_finder_result_free;
-  ostree_repo_finder_result_new;
-  ostree_repo_pull_from_remotes_async;
-  ostree_repo_pull_from_remotes_finish;
-} LIBOSTREE_2017.6;
+#include <gio/gio.h>
+#include <glib.h>
+#include <glib-object.h>
+
+#include "ostree-repo.h"
+#include "ostree-repo-finder.h"
+#include "ostree-types.h"
+
+G_BEGIN_DECLS
+
+#define OSTREE_TYPE_REPO_FINDER_CONFIG (ostree_repo_finder_config_get_type ())
+
+_OSTREE_PUBLIC
+G_DECLARE_FINAL_TYPE (OstreeRepoFinderConfig, ostree_repo_finder_config, OSTREE, REPO_FINDER_CONFIG, GObject)
+
+_OSTREE_PUBLIC
+OstreeRepoFinderConfig *ostree_repo_finder_config_new (OstreeRepo *repo);
+
+G_END_DECLS

@@ -40,4 +40,5 @@
 
 #ifdef OSTREE_ENABLE_EXPERIMENTAL_API
 #include <ostree-repo-finder.h>
+#include <ostree-repo-finder-config.h>
 #endif /* OSTREE_ENABLE_EXPERIMENTAL_API */
