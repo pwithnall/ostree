@@ -153,6 +153,12 @@ libostree_1_la_SOURCES += \
 	src/libostree/ostree-remote.h \
 	$(NULL)
 endif
+if ENABLE_EXPERIMENTAL_API
+libostree_1_la_SOURCES += \
+	src/libostree/ostree-repo-finder.c \
+	src/libostree/ostree-repo-finder.h \
+	$(NULL)
+endif
 
 libostree_1_la_CFLAGS = $(AM_CFLAGS) -I$(srcdir)/bsdiff -I$(srcdir)/libglnx -I$(srcdir)/src/libotutil -I$(srcdir)/src/libostree -I$(builddir)/src/libostree \
 	$(OT_INTERNAL_GIO_UNIX_CFLAGS) $(OT_INTERNAL_GPGME_CFLAGS) $(OT_DEP_LZMA_CFLAGS) $(OT_DEP_ZLIB_CFLAGS) $(OT_DEP_OPENSSL_CFLAGS) \

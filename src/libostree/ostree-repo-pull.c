@@ -1,6 +1,7 @@
 /* -*- mode: C; c-file-style: "gnu"; indent-tabs-mode: nil; -*-
  *
  * Copyright (C) 2011,2012,2013 Colin Walters <walters@verbum.org>
+ * Copyright © 2017 Endless Mobile, Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -17,7 +18,9 @@
  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
  * Boston, MA 02111-1307, USA.
  *
- * Author: Colin Walters <walters@verbum.org>
+ * Authors:
+ *  - Colin Walters <walters@verbum.org>
+ *  - Philip Withnall <withnall@endlessm.com>
  */
 
 #include "config.h"
@@ -33,7 +36,12 @@
 #include "ostree-repo-static-delta-private.h"
 #include "ostree-metalink.h"
 #include "ostree-fetcher-util.h"
+#include "ostree-remote-private.h"
 #include "ot-fs-utils.h"
+
+#ifdef OSTREE_ENABLE_EXPERIMENTAL_API
+#include "ostree-repo-finder.h"
+#endif /* OSTREE_ENABLE_EXPERIMENTAL_API */
 
 #include <gio/gunixinputstream.h>
 
@@ -2508,6 +2516,11 @@ repo_remote_fetch_summary (OstreeRepo    *self,
       }
   }
 
+  /* FIXME: Send the ETag from the cache with the request for summary.sig to
+   * avoid downloading summary.sig unnecessarily. This won’t normally provide
+   * any benefits (but won’t do any harm) since summary.sig is typically 500B
+   * in size. But if a repository has multiple keys, the signature file will
+   * grow and this optimisation may be useful. */
   if (!_ostree_preload_metadata_file (self,
                                       fetcher,
                                       mirrorlist,
@@ -3574,6 +3587,981 @@ ostree_repo_pull_with_options (OstreeRepo             *self,
   g_clear_pointer (&remote_config, (GDestroyNotify) g_key_file_unref);
   return ret;
 }
+
+#ifdef OSTREE_ENABLE_EXPERIMENTAL_API
+
+/* Structure used in ostree_repo_find_remotes_async() which stores metadata
+ * about a given OSTree commit. This includes the metadata from the commit
+ * #GVariant, plus some working state which is used to work out which remotes
+ * have refs pointing to this commit. */
+typedef struct
+{
+  gchar *checksum;  /* always set */
+  guint64 commit_size;  /* always set */
+  guint64 timestamp;  /* 0 for unknown */
+  GVariant *additional_metadata;
+  GArray *refs;  /* (element-type gsize), indexes to refs which point to this commit on at least one remote */
+} CommitMetadata;
+
+static void
+commit_metadata_free (CommitMetadata *info)
+{
+  g_clear_pointer (&info->refs, g_array_unref);
+  g_free (info->checksum);
+  g_clear_pointer (&info->additional_metadata, g_variant_unref);
+  g_free (info);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (CommitMetadata, commit_metadata_free)
+
+static CommitMetadata *
+commit_metadata_new (const gchar *checksum,
+                     guint64      commit_size,
+                     guint64      timestamp,
+                     GVariant    *additional_metadata)
+{
+  g_autoptr(CommitMetadata) info = NULL;
+
+  info = g_new0 (CommitMetadata, 1);
+  info->checksum = g_strdup (checksum);
+  info->commit_size = commit_size;
+  info->timestamp = timestamp;
+  info->additional_metadata = (additional_metadata != NULL) ? g_variant_ref (additional_metadata) : NULL;
+  info->refs = g_array_new (FALSE, FALSE, sizeof (gsize));
+
+  return g_steal_pointer (&info);
+}
+
+/* Structure used in ostree_repo_find_remotes_async() to store a grid (or table)
+ * of pointers, indexed by rows and columns. Basically an encapsulated 2D array.
+ * See the comments in ostree_repo_find_remotes_async() for its semantics
+ * there. */
+typedef struct
+{
+  gsize width;  /* pointers */
+  gsize height;  /* pointers */
+  gconstpointer pointers[];  /* n_pointers = width * height */
+} PointerTable;
+
+static void
+pointer_table_free (PointerTable *table)
+{
+  g_free (table);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (PointerTable, pointer_table_free)
+
+/* Both dimensions are in numbers of pointers. */
+static PointerTable *
+pointer_table_new (gsize width,
+                   gsize height)
+{
+  g_autoptr(PointerTable) table = NULL;
+
+  g_return_val_if_fail (width > 0, NULL);
+  g_return_val_if_fail (height > 0, NULL);
+  g_return_val_if_fail (width <= (G_MAXSIZE - sizeof (PointerTable)) / sizeof (gconstpointer) / height, NULL);
+
+  table = g_malloc0 (sizeof (PointerTable) + sizeof (gconstpointer) * width * height);
+  table->width = width;
+  table->height = height;
+
+  return g_steal_pointer (&table);
+}
+
+static gconstpointer
+pointer_table_get (const PointerTable *table,
+                   gsize               x,
+                   gsize               y)
+{
+  g_return_val_if_fail (table != NULL, FALSE);
+  g_return_val_if_fail (x < table->width, FALSE);
+  g_return_val_if_fail (y < table->height, FALSE);
+
+  return table->pointers[table->width * y + x];
+}
+
+static void
+pointer_table_set (PointerTable  *table,
+                   gsize          x,
+                   gsize          y,
+                   gconstpointer  value)
+{
+  g_return_if_fail (table != NULL);
+  g_return_if_fail (x < table->width);
+  g_return_if_fail (y < table->height);
+
+  table->pointers[table->width * y + x] = value;
+}
+
+static gboolean
+strv_find (const gchar * const *haystack,
+           const gchar         *needle,
+           gsize               *out_index)
+{
+  gsize i;
+
+  for (i = 0; haystack[i] != NULL; i++)
+    {
+      if (g_strcmp0 (haystack[i], needle) == 0)
+        {
+          *out_index = i;
+          return TRUE;
+        }
+    }
+
+  return FALSE;
+}
+
+/* Validate the given string is potentially a ref name. */
+static gboolean
+is_valid_ref_name (const gchar *ref_name)
+{
+  return (ref_name != NULL && *ref_name != '\0' && g_str_is_ascii (ref_name));
+}
+
+/* Validate @refs is non-%NULL, non-empty, and contains only valid ref names. */
+static gboolean
+is_valid_ref_array (const gchar * const *refs)
+{
+  gsize i;
+
+  if (refs == NULL || *refs == NULL)
+    return FALSE;
+
+  for (i = 0; refs[i] != NULL; i++)
+    {
+      if (!is_valid_ref_name (refs[i]))
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* Validate @finders is non-%NULL, non-empty, and contains only valid
+ * #OstreeRepoFinder instances. */
+static gboolean
+is_valid_finder_array (OstreeRepoFinder **finders)
+{
+  gsize i;
+
+  if (finders == NULL || *finders == NULL)
+    return FALSE;
+
+  for (i = 0; finders[i] != NULL; i++)
+    {
+      if (!OSTREE_IS_REPO_FINDER (finders[i]))
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* Closure used to carry inputs from ostree_repo_find_remotes_async() to
+ * find_remotes_cb(). */
+typedef struct
+{
+  gchar **refs;
+  GVariant *options;
+  OstreeAsyncProgress *progress;
+} FindRemotesData;
+
+static void
+find_remotes_data_free (FindRemotesData *data)
+{
+  g_clear_object (&data->progress);
+  g_clear_pointer (&data->options, g_variant_unref);
+  g_strfreev (data->refs);
+
+  g_free (data);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (FindRemotesData, find_remotes_data_free)
+
+static FindRemotesData *
+find_remotes_data_new (const gchar * const *refs,
+                       GVariant            *options,
+                       OstreeAsyncProgress *progress)
+{
+  g_autoptr(FindRemotesData) data = NULL;
+
+  data = g_new0 (FindRemotesData, 1);
+  data->refs = g_strdupv ((gchar **) refs);
+  data->options = (options != NULL) ? g_variant_ref (options) : NULL;
+  data->progress = (progress != NULL) ? g_object_ref (progress) : NULL;
+
+  return g_steal_pointer (&data);
+}
+
+static gchar *
+uint64_secs_to_iso8601 (guint64 secs)
+{
+  g_autoptr(GDateTime) dt = g_date_time_new_from_unix_utc (secs);
+
+  if (dt != NULL)
+    return g_date_time_format (dt, "%FT%TZ");
+  else
+    return g_strdup ("invalid");
+}
+
+static gint
+sort_results_cb (gconstpointer a,
+                 gconstpointer b)
+{
+  const OstreeRepoFinderResult **result_a = (const OstreeRepoFinderResult **) a;
+  const OstreeRepoFinderResult **result_b = (const OstreeRepoFinderResult **) b;
+
+  return ostree_repo_finder_result_compare (*result_a, *result_b);
+}
+
+static void find_remotes_cb (GObject      *obj,
+                             GAsyncResult *result,
+                             gpointer      user_data);
+
+/**
+ * ostree_repo_find_remotes_async:
+ * @self: an #OstreeRepo
+ * @refs: (array zero-terminated=1): non-empty array of refs to find remotes for
+ * @options: (nullable): a GVariant `a{sv}` with an extensible set of flags
+ * @finders: (array zero-terminated=1) (transfer none): non-empty array of
+ *    #OstreeRepoFinder instances to use, or %NULL to use the system defaults
+ * @progress: (nullable): an #OstreeAsyncProgress to update with the operation’s
+ *    progress, or %NULL
+ * @cancellable: (nullable): a #GCancellable, or %NULL
+ * @callback: asynchronous completion callback
+ * @user_data: data to pass to @callback
+ *
+ * Find reachable remote URIs which claim to provide any of the given named
+ * @refs. This will search for configured remotes (#OstreeRepoFinderConfig),
+ * mounted volumes (#OstreeRepoFinderMount) and (if enabled at compile time)
+ * local network peers (#OstreeRepoFinderAvahi). In order to use a custom
+ * configuration of #OstreeRepoFinder instances, call
+ * ostree_repo_finder_resolve_all_async() on them individually.
+ *
+ * Any remote which is found and which claims to support any of the given @refs
+ * will be returned in the results. It is possible that a remote claims to
+ * support a given ref, but turns out not to — it is not possible to verify this
+ * until ostree_repo_pull_from_remotes_async() is called.
+ *
+ * The returned results will be sorted with the most useful first — this is
+ * typically the remote which claims to provide the most of @refs, at the lowest
+ * latency.
+ *
+ * Each result contains a list of the subset of @refs it claims to provide. It
+ * is possible for a non-empty list of results to be returned, but for some of
+ * @refs to not be listed in any of the results. Callers must check for this.
+ *
+ * Pass the results to ostree_repo_pull_from_remotes_async() to pull the given @refs
+ * from those remotes.
+ *
+ * No @options are currently supported.
+ *
+ * @finders must be a non-empty %NULL-terminated array of the #OstreeRepoFinder
+ * instances to use, or %NULL to use the system default set of finders, which
+ * will typically be all available finders using their default options (but
+ * this is not guaranteed).
+ *
+ * This will use the thread-default #GMainContext, but will not iterate it.
+ *
+ * Since: 2017.6
+ */
+void
+ostree_repo_find_remotes_async (OstreeRepo           *self,
+                                const gchar * const  *refs,
+                                GVariant             *options,
+                                OstreeRepoFinder    **finders,
+                                OstreeAsyncProgress  *progress,
+                                GCancellable         *cancellable,
+                                GAsyncReadyCallback   callback,
+                                gpointer              user_data)
+{
+  g_autoptr(GTask) task = NULL;
+  g_autoptr(FindRemotesData) data = NULL;
+  GMainContext *context;
+  OstreeRepoFinder *default_finders[4] = { NULL, };
+
+  g_return_if_fail (OSTREE_IS_REPO (self));
+  g_return_if_fail (is_valid_ref_array (refs));
+  g_return_if_fail (options == NULL ||
+                    g_variant_is_of_type (options, G_VARIANT_TYPE_VARDICT));
+  g_return_if_fail (finders == NULL || is_valid_finder_array (finders));
+  g_return_if_fail (progress == NULL || OSTREE_IS_ASYNC_PROGRESS (progress));
+  g_return_if_fail (cancellable == NULL || G_IS_CANCELLABLE (cancellable));
+
+  /* Set up a task for the whole operation. */
+  task = g_task_new (self, cancellable, callback, user_data);
+  g_task_set_source_tag (task, ostree_repo_find_remotes_async);
+
+  context = g_main_context_get_thread_default ();
+
+  /* Are we using #OstreeRepoFinders provided by the user, or the defaults? */
+  if (finders == NULL)
+    {
+      finders = default_finders;
+    }
+
+  data = find_remotes_data_new (refs, options, progress);
+  g_task_set_task_data (task, g_steal_pointer (&data), (GDestroyNotify) find_remotes_data_free);
+
+  /* Asynchronously resolve all possible remotes for the given refs. */
+  ostree_repo_finder_resolve_all_async (finders, refs, cancellable,
+                                        find_remotes_cb, g_steal_pointer (&task));
+}
+
+static void
+find_remotes_cb (GObject      *obj,
+                 GAsyncResult *result,
+                 gpointer      user_data)
+{
+  OstreeRepo *self;
+  g_autoptr(GTask) task = NULL;
+  GCancellable *cancellable;
+  const FindRemotesData *data;
+  const gchar * const *refs;
+  OstreeAsyncProgress *progress;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GPtrArray) results = NULL;  /* (element-type OstreeRepoFinderResult) */
+  gsize i;
+  GHashTableIter iter;
+  CommitMetadata *commit_metadata;
+  g_autoptr(PointerTable) refs_and_remotes_table = NULL;  /* (element-type commit-checksum) */
+  g_autoptr(GHashTable) commit_metadatas = NULL;  /* (element-type commit-checksum CommitMetadata) */
+  g_autoptr(OstreeFetcher) fetcher = NULL;
+  g_autofree const gchar **ref_to_latest_commit = NULL;  /* indexed as @refs; (element-type commit-checksum) */
+  gsize n_refs;
+  const gchar *checksum;
+
+  task = G_TASK (user_data);
+  self = OSTREE_REPO (g_task_get_source_object (task));
+  cancellable = g_task_get_cancellable (task);
+  data = g_task_get_task_data (task);
+
+  refs = (const gchar * const *) data->refs;
+  progress = data->progress;
+
+  /* Finish finding the remotes. */
+  results = ostree_repo_finder_resolve_all_finish (result, &error);
+
+  if (results == NULL)
+    {
+      g_task_return_error (task, g_steal_pointer (&error));
+      return;
+    }
+
+  if (results->len == 0)
+    {
+      g_ptr_array_add (results, NULL);  /* NULL terminator */
+      g_task_return_pointer (task, g_steal_pointer (&results), (GDestroyNotify) g_ptr_array_unref);
+      return;
+    }
+
+  /* FIXME: In future, we also want to pull static delta superblocks in this
+   * phase, so that we have all the metadata we need for accurate size
+   * estimation for the actual pull operation. */
+
+  /* TODO: We currently do nothing with @progress. */
+  /* TODO: think about security here: how can we secure this all? */
+
+  commit_metadatas = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) commit_metadata_free);
+
+  /* X dimension is an index into @refs. Y dimension is an index into @results.
+   * Each cell stores the commit checksum which that ref resolves to on that
+   * remote, or %NULL if the remote doesn’t have that ref. */
+  n_refs = g_strv_length ((gchar **) refs);
+  refs_and_remotes_table = pointer_table_new (n_refs, results->len);
+
+  /* Fetch and validate the summary file for each result. */
+  /* FIXME: All these downloads could be parallelised; that requires the
+   * ostree_repo_remote_fetch_summary_with_options() API to be async. */
+  for (i = 0; i < results->len; i++)
+    {
+      OstreeRepoFinderResult *result = g_ptr_array_index (results, i);
+      g_autoptr(GBytes) summary_bytes = NULL, summary_sig_bytes = NULL;
+      g_autoptr(GVariant) summary_v = NULL;
+      const gchar *ref_name;
+      guint64 summary_last_modified;
+      g_autoptr(GVariant) summary_refs = NULL;
+      gsize n, j;
+      g_autoptr(GVariant) additional_metadata_v = NULL;
+
+      g_debug ("%s: Fetching summary for remote ‘%s’.",
+               G_STRFUNC, result->remote->name);
+
+      /* Download the summary and signature, and validate the signature. This
+       * will load from the cache if possible. */
+      ostree_repo_remote_fetch_summary_with_options (self,
+                                                     result->remote->name,
+                                                     NULL,  /* no options */
+                                                     &summary_bytes,
+                                                     &summary_sig_bytes,
+                                                     cancellable,
+                                                     &error);
+
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        {
+          g_task_return_error (task, g_steal_pointer (&error));
+          return;
+        }
+      else if (error != NULL)
+        {
+          g_debug ("%s: Failed to download summary for result ‘%s’. Ignoring.",
+                   G_STRFUNC, result->remote->name);
+          /* TODO: Not sure this g_clear_pointer() call is safe. */
+          g_clear_pointer (&g_ptr_array_index (results, i), (GDestroyNotify) ostree_repo_finder_result_free);
+          g_clear_error (&error);
+          continue;
+        }
+
+      /* Check the metadata in the summary file, especially whether it contains
+       * all the @refs we are interested in. */
+      summary_v = g_variant_new_from_bytes (OSTREE_SUMMARY_GVARIANT_FORMAT,
+                                            summary_bytes, FALSE);
+      summary_refs = g_variant_get_child_value (summary_v, 0);
+      n = g_variant_n_children (summary_refs);
+      for (j = 0; j < n; j++)
+        {
+          const guchar *csum_bytes;
+          g_autoptr(GVariant) ref_v = NULL, csum_v = NULL, commit_metadata_v = NULL;
+          guint64 commit_size, commit_timestamp;
+          gchar tmp_checksum[OSTREE_SHA256_STRING_LEN + 1];
+          gsize ref_index;
+          g_autoptr(GDateTime) dt = NULL;
+
+          /* Check the ref name. */
+          ref_v = g_variant_get_child_value (summary_refs, j);
+          g_variant_get_child (ref_v, 0, "&s", &ref_name);
+
+          /* TODO: Are the allowed and recommended formats for naming refs documented
+           * somewhere? */
+          if (!ostree_validate_rev (ref_name, &error))
+            {
+              g_debug ("%s: Summary for result ‘%s’ contained invalid ref name ‘%s’: %s",
+                       G_STRFUNC, result->remote->name, ref_name, error->message);
+              g_clear_error (&error);
+              break;
+            }
+
+          /* Check the commit checksum. */
+          g_variant_get_child (ref_v, 1, "(t@ay@a{sv})", &commit_size, &csum_v, &commit_metadata_v);
+
+          csum_bytes = ostree_checksum_bytes_peek_validate (csum_v, &error);
+          if (csum_bytes == NULL)
+            {
+              g_debug ("%s: Summary for result ‘%s’ contained invalid ref checksum: %s",
+                       G_STRFUNC, result->remote->name, error->message);
+              g_clear_error (&error);
+              break;
+            }
+
+          ostree_checksum_inplace_from_bytes (csum_bytes, tmp_checksum);
+
+          /* Is this a ref we care about? */
+          if (!strv_find (refs, ref_name, &ref_index))
+            continue;
+
+          /* TODO: We probably also want to load the commit from the local repo
+           * too, if it exists, since that will be the most common case of all
+           * the peers advertising the commit we’re already on. */
+
+          /* Check the additional metadata. */
+          if (!g_variant_lookup (commit_metadata_v, OSTREE_COMMIT_TIMESTAMP, "t", &commit_timestamp))
+            commit_timestamp = 0;  /* unknown */
+
+          dt = g_date_time_new_from_unix_utc (commit_timestamp);
+
+          if (dt == NULL)
+            {
+              g_debug ("%s: Summary for result ‘%s’ contained commit timestamp %" G_GUINT64_FORMAT " which is too far in the future. Resetting to 0.",
+                       G_STRFUNC, result->remote->name, commit_timestamp);
+              commit_timestamp = 0;
+            }
+
+          /* Check and store the commit metadata. */
+          commit_metadata = g_hash_table_lookup (commit_metadatas, tmp_checksum);
+
+          if (commit_metadata == NULL)
+            {
+              commit_metadata = commit_metadata_new (tmp_checksum, commit_size, commit_timestamp, NULL);
+              g_hash_table_insert (commit_metadatas, g_strdup (tmp_checksum),
+                                   commit_metadata  /* transfer */);
+            }
+
+          /* Update the metadata if possible. */
+          if (commit_metadata->timestamp == 0)
+            {
+              commit_metadata->timestamp = commit_timestamp;
+            }
+          else if (commit_timestamp != 0 && commit_metadata->timestamp != commit_timestamp)
+            {
+              g_debug ("%s: Summary for result ‘%s’ contained commit timestamp %" G_GUINT64_FORMAT " which did not match existing timestamp %" G_GUINT64_FORMAT ". Ignoring.",
+                       G_STRFUNC, result->remote->name, commit_timestamp, commit_metadata->timestamp);
+              break;
+            }
+
+          pointer_table_set (refs_and_remotes_table, ref_index, i, commit_metadata->checksum);
+          g_array_append_val (commit_metadata->refs, ref_index);
+
+          g_debug ("%s: Remote ‘%s’ lists ref ‘%s’ mapping to commit ‘%s’.",
+                   G_STRFUNC, result->remote->name, ref_name, commit_metadata->checksum);
+        }
+
+      /* Error in the refs loop? */
+      if (j != n)
+        {
+          /* TODO: Not sure this g_clear_pointer() call is safe. */
+          g_clear_pointer (&g_ptr_array_index (results, i), (GDestroyNotify) ostree_repo_finder_result_free);
+          continue;
+        }
+
+      /* Check the summary’s additional metadata. */
+      additional_metadata_v = g_variant_get_child_value (summary_v, 1);
+
+      if (!g_variant_lookup (additional_metadata_v, OSTREE_SUMMARY_LAST_MODIFIED, "t", &summary_last_modified))
+        summary_last_modified = 0;
+
+      /* Update the stored result data. Clear the @refs array, since it’s been
+       * moved to @refs_and_remotes_table and is now potentially out of date. */
+      g_clear_pointer (&result->refs, g_strfreev);
+      result->summary_last_modified = summary_last_modified;
+    }
+
+  /* Fill in any gaps in the metadata for the most recent commits by pulling
+   * the commit metadata from the remotes. The ‘most recent commits’ are the
+   * set of head commits pointed to by the refs we just resolved from the
+   * summary files. */
+  /* TODO: construct a fetcher properly, paying attention to all the options */
+  fetcher = _ostree_fetcher_new (self->tmp_dir_fd  /* TODO */, "", 0);
+  g_hash_table_iter_init (&iter, commit_metadatas);
+
+  while (g_hash_table_iter_next (&iter, (gpointer *) &checksum, (gpointer *) &commit_metadata))
+    {
+      char buf[_OSTREE_LOOSE_PATH_MAX];
+      g_autofree gchar *commit_filename = NULL;
+      g_autoptr(GPtrArray) mirrorlist = NULL;  /* (element-type OstreeFetcherURI) */
+      g_autoptr(GBytes) commit_bytes = NULL;
+      g_autoptr(GVariant) commit_v = NULL;
+      guint64 commit_timestamp;
+      g_autoptr(GDateTime) dt = NULL;
+
+      /* Already complete? */
+      if (commit_metadata->timestamp != 0)
+        continue;
+
+      _ostree_loose_path (buf, commit_metadata->checksum, OSTREE_OBJECT_TYPE_COMMIT, OSTREE_REPO_MODE_ARCHIVE_Z2);
+      commit_filename = g_build_filename ("objects", buf, NULL);
+
+      /* Build a @mirrorlist for this ref from the remotes whose summary files
+       * contain it. The @mirrorlist should come out in the same order as
+       * @results, which means the most important mirrors are first, as desired.
+       * TODO: Support remotes which have contenturl, mirrorlist, etc.
+       * config keys. */
+      mirrorlist = g_ptr_array_new_with_free_func ((GDestroyNotify) _ostree_fetcher_uri_free);
+
+      for (i = 0; i < commit_metadata->refs->len; i++)
+        {
+          gsize ref_index = g_array_index (commit_metadata->refs, gsize, i);
+          gsize j;
+
+          for (j = 0; j < results->len; j++)
+            {
+              if (pointer_table_get (refs_and_remotes_table, ref_index, j) == commit_metadata->checksum)
+                {
+                  OstreeRepoFinderResult *result = g_ptr_array_index (results, j);
+                  g_autofree gchar *uri = NULL;
+                  g_autoptr(OstreeFetcherURI) fetcher_uri = NULL;
+
+                  if (!ostree_repo_remote_get_url (self, result->remote->name,
+                                                   &uri, &error))
+                    {
+                      g_task_return_error (task, g_steal_pointer (&error));
+                      return;
+                    }
+
+                  fetcher_uri = _ostree_fetcher_uri_parse (uri, &error);
+                  if (fetcher_uri == NULL)
+                    {
+                      g_task_return_error (task, g_steal_pointer (&error));
+                      return;
+                    }
+
+                  g_ptr_array_add (mirrorlist, g_steal_pointer (&fetcher_uri));
+                }
+            }
+        }
+
+      g_debug ("%s: Fetching metadata for commit ‘%s’.", G_STRFUNC, commit_metadata->checksum);
+
+      /* TODO: ensure this checks the commit signature; or that the checksum matches the downloaded content */
+      if (!_ostree_fetcher_mirrored_request_to_membuf (fetcher,
+                                                       mirrorlist,
+                                                       commit_filename,
+                                                       FALSE,  /* don’t add trailing nul */
+                                                       FALSE,  /* return an error on ENOENT */
+                                                       &commit_bytes,
+                                                       0,  /* no maximum size */
+                                                       cancellable,
+                                                       &error))
+        {
+          g_task_return_error (task, g_steal_pointer (&error));
+          return;
+        }
+
+      /* Parse the commit metadata. */
+      commit_v = g_variant_new_from_bytes (OSTREE_COMMIT_GVARIANT_FORMAT,
+                                           commit_bytes, FALSE);
+      g_variant_get_child (commit_v, 5, "t", &commit_timestamp);
+      dt = g_date_time_new_from_unix_utc (commit_timestamp);
+
+      if (dt == NULL)
+        {
+          g_debug ("%s: Commit ‘%s’ metadata contained timestamp %" G_GUINT64_FORMAT " which is too far in the future. Resetting to 0.",
+                   G_STRFUNC, commit_metadata->checksum, commit_timestamp);
+          commit_timestamp = 0;
+        }
+
+      /* Update the #CommitMetadata. */
+      commit_metadata->timestamp = commit_timestamp;
+    }
+
+  /* TODO: The data structures round here are a complete mess and need a fresh eye. */
+  /* Find the latest commit for each ref. This is where we resolve the
+   * differences between remotes: two remotes could both contain ref R, but one
+   * remote could be outdated compared to the other, and point to an older
+   * commit. For each ref, we want to find the most recent commit any remote
+   * points to for it. */
+  ref_to_latest_commit = g_new0 (const gchar *, n_refs);
+
+  for (i = 0; i < n_refs; i++)
+    {
+      gsize j;
+      const gchar *latest_checksum = NULL;
+      const CommitMetadata *latest_commit_metadata = NULL;
+      g_autofree gchar *latest_commit_timestamp_str = NULL;
+
+      for (j = 0; j < results->len; j++)
+        {
+          const CommitMetadata *candidate_commit_metadata;
+          const gchar *candidate_checksum;
+
+          candidate_checksum = pointer_table_get (refs_and_remotes_table, i, j);
+
+          if (candidate_checksum == NULL)
+            continue;
+
+          candidate_commit_metadata = g_hash_table_lookup (commit_metadatas, candidate_checksum);
+          g_assert (candidate_commit_metadata != NULL);
+
+          if (latest_commit_metadata == NULL ||
+              candidate_commit_metadata->timestamp > latest_commit_metadata->timestamp)
+            {
+              latest_checksum = candidate_checksum;
+              latest_commit_metadata = candidate_commit_metadata;
+            }
+        }
+
+      ref_to_latest_commit[i] = latest_checksum;
+
+      latest_commit_timestamp_str = uint64_secs_to_iso8601 (latest_commit_metadata->timestamp);
+      g_debug ("%s: Latest commit for ref ‘%s’ across all remotes is ‘%s’ with timestamp %s.",
+               G_STRFUNC, refs[i], latest_checksum, latest_commit_timestamp_str);
+    }
+
+  /* Recombine @commit_metadatas and @results so that each
+   * #OstreeRepoFinderResult.refs lists the refs for which that remote has the
+   * latest commits (i.e. it’s not out of date compared to some other remote). */
+  g_autoptr(GPtrArray) final_results = g_ptr_array_new_with_free_func ((GDestroyNotify) ostree_repo_finder_result_free);
+
+  for (i = 0; i < results->len; i++)
+    {
+      OstreeRepoFinderResult *result = g_ptr_array_index (results, i);
+      g_autoptr(GPtrArray) validated_refs = NULL;
+      gsize j;
+
+      validated_refs = g_ptr_array_new_with_free_func (g_free);
+
+      for (j = 0; refs[j] != NULL; j++)
+        {
+          const gchar *latest_commit_for_ref = ref_to_latest_commit[j];
+
+          if (pointer_table_get (refs_and_remotes_table, j, i) == latest_commit_for_ref)
+            g_ptr_array_add (validated_refs, g_strdup (refs[j]));
+        }
+
+      if (validated_refs->len == 0)
+        {
+          g_debug ("%s: Omitting remote ‘%s’ from results as none of its refs are new enough.",
+                   G_STRFUNC, result->remote->name);
+          ostree_repo_finder_result_free (g_steal_pointer (&g_ptr_array_index (results, i)));
+          continue;
+        }
+
+      g_ptr_array_add (validated_refs, NULL);  /* NULL terminator */
+      result->refs = (gchar **) g_ptr_array_free (g_steal_pointer (&validated_refs), FALSE);
+      g_ptr_array_add (final_results, g_steal_pointer (&g_ptr_array_index (results, i)));
+    }
+
+  g_ptr_array_set_free_func (results, NULL);
+  g_ptr_array_set_size (results, 0);
+
+  /* Ensure the updated results are still in priority order. */
+  g_ptr_array_sort (final_results, sort_results_cb);
+  g_ptr_array_add (final_results, NULL);  /* NULL terminator */
+
+  g_task_return_pointer (task, g_steal_pointer (&final_results), (GDestroyNotify) g_ptr_array_unref);
+}
+
+/* TODO: How do we report that the local commit for a ref is already the latest? */
+
+/**
+ * ostree_repo_find_remotes_finish:
+ * @self: an #OstreeRepo
+ * @result: the asynchronous result
+ * @error: return location for a #GError, or %NULL
+ *
+ * Finish an asynchronous pull operation started with
+ * ostree_repo_find_remotes_async().
+ *
+ * Returns: (transfer full) (array zero-terminated=1): a potentially empty array
+ *    of #OstreeRepoFinderResults, followed by a %NULL terminator element; or
+ *    %NULL on error
+ * Since: 2017.6
+ */
+OstreeRepoFinderResult **
+ostree_repo_find_remotes_finish (OstreeRepo    *self,
+                                 GAsyncResult  *result,
+                                 GError       **error)
+{
+  g_autoptr(GPtrArray) results = NULL;
+
+  g_return_val_if_fail (OSTREE_IS_REPO (self), NULL);
+  g_return_val_if_fail (g_task_is_valid (result, self), NULL);
+  g_return_val_if_fail (g_async_result_is_tagged (result, ostree_repo_find_remotes_async), NULL);
+  g_return_val_if_fail (error == NULL || *error == NULL, NULL);
+
+  results = g_task_propagate_pointer (G_TASK (result), error);
+
+  if (results != NULL)
+    return (OstreeRepoFinderResult **) g_ptr_array_free (g_steal_pointer (&results), FALSE);
+  else
+    return NULL;
+}
+
+static void
+copy_option (GVariantDict       *master_options,
+             GVariantDict       *slave_options,
+             const gchar        *key,
+             const GVariantType *expected_type)
+{
+  g_autoptr(GVariant) option_v = g_variant_dict_lookup_value (master_options, key, expected_type);
+  if (option_v != NULL)
+    g_variant_dict_insert_value (slave_options, key, g_steal_pointer (&option_v));
+}
+
+/**
+ * ostree_repo_pull_from_remotes_async:
+ * @self: an #OstreeRepo
+ * @results: (array zero-terminated=1): %NULL-terminated array of remotes to
+ *    pull from, including the refs to pull from each
+ * @options: (nullable): A GVariant `a{sv}` with an extensible set of flags
+ * @progress: (nullable): an #OstreeAsyncProgress to update with the operation’s
+ *    progress, or %NULL
+ * @cancellable: (nullable): a #GCancellable, or %NULL
+ * @callback: asynchronous completion callback
+ * @user_data: data to pass to @callback
+ *
+ * Pull refs from multiple remotes which have been found using
+ * ostree_repo_find_remotes_async().
+ *
+ * @results are expected to be in priority order, with the best remotes to pull
+ * from listed first. ostree_repo_pull_from_remotes_async() will generally pull
+ * from the remotes in order, but may parallelise its downloads.
+ *
+ * If an error is encountered when pulling from a given remote, that remote will
+ * be ignored and another will be tried instead. If any refs have not been
+ * downloaded successfully after all remotes have been tried, %G_IO_ERROR_FAILED
+ * will be returned. The results of any successful downloads will remain cached
+ * in the local repository.
+ *
+ * If @cancellable is cancelled, %G_IO_ERROR_CANCELLED will be returned
+ * immediately. The results of any successfully completed downloads at that
+ * point will remain cached in the local repository.
+ *
+ * Since: 2017.6
+ */
+void
+ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
+                                     const OstreeRepoFinderResult * const *results,
+                                     GVariant                             *options,
+                                     OstreeAsyncProgress                  *progress,
+                                     GCancellable                         *cancellable,
+                                     GAsyncReadyCallback                   callback,
+                                     gpointer                              user_data)
+{
+  g_autoptr(GTask) task = NULL;
+  g_autoptr(GHashTable) refs_pulled = NULL;  /* (element-type utf8 gboolean) */
+  gsize i, j;
+  g_autoptr(GString) refs_unpulled_string = NULL;
+  GHashTableIter iter;
+  const gchar *ref;
+  gpointer is_pulled_pointer;
+  g_autoptr(GError) local_error = NULL;
+  g_auto(GVariantDict) options_dict = OT_VARIANT_BUILDER_INITIALIZER;
+
+  /* Set up a task for the whole operation. */
+  task = g_task_new (self, cancellable, callback, user_data);
+  g_task_set_source_tag (task, ostree_repo_pull_from_remotes_async);
+
+  /* Keep track of the set of refs we’ve pulled already. Value is %TRUE if the
+   * ref has been pulled; %FALSE if it has not. */
+  refs_pulled = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, NULL);
+
+  g_variant_dict_init (&options_dict, options);
+
+  /* Run all the local pull operations in a single overall transaction. */
+  if (!ostree_repo_prepare_transaction (self, NULL, cancellable, &local_error))
+    {
+      g_task_return_error (task, g_steal_pointer (&local_error));
+      return;
+    }
+
+  /* FIXME: Currently, this code will only work if the refs are all signed using
+   * a key in the global keyring (or if we’re pulling from an internet remote
+   * which has appropriate per-remote keys configured). There is no way to share
+   * a per-remote key configuration between, say, an internet remote and a local
+   * network remote. This will have to be addressed in future. */
+
+  /* FIXME: Rework this code to pull in parallel where possible. At the moment
+   * we expect the (i == 0) iteration will do all the work (all the refs) and
+   * subsequent iterations are only there in case of error.
+   *
+   * The code is currently all synchronous, too. Making it asynchronous requires
+   * the underlying pull code to be asynchronous. */
+  for (i = 0; results[i] != NULL; i++)
+    {
+      const OstreeRepoFinderResult *result = results[i];
+      g_autoptr(GPtrArray) refs_to_pull = NULL;
+      g_auto(GVariantDict) local_options_dict = OT_VARIANT_BUILDER_INITIALIZER;
+      g_autoptr(GVariant) local_options = NULL;
+
+      refs_to_pull = g_ptr_array_new_with_free_func (NULL);
+
+      for (j = 0; result->refs[j] != NULL; j++)
+        if (!GPOINTER_TO_INT (g_hash_table_lookup (refs_pulled, result->refs[j])))
+          g_ptr_array_add (refs_to_pull, result->refs[j]);
+
+      if (refs_to_pull->len == 0)
+        {
+          g_debug ("Ignoring remote ‘%s’ as it has no relevent refs.",
+                   result->remote->name);
+          continue;
+        }
+
+      /* NULL terminator. */
+      g_ptr_array_add (refs_to_pull, NULL);
+
+      g_variant_dict_init (&local_options_dict, NULL);
+
+      g_variant_dict_insert (&local_options_dict, "flags", "i", OSTREE_REPO_PULL_FLAGS_UNTRUSTED);
+      g_variant_dict_insert (&local_options_dict, "refs", "^as", refs_to_pull->pdata);
+      g_variant_dict_insert (&local_options_dict, "gpg-verify", "b", TRUE);
+      g_variant_dict_insert (&local_options_dict, "inherit-transaction", "b", TRUE);
+      copy_option (&options_dict, &local_options_dict, "depth", G_VARIANT_TYPE ("i"));
+      copy_option (&options_dict, &local_options_dict, "http-headers", G_VARIANT_TYPE ("a(ss)"));
+      copy_option (&options_dict, &local_options_dict, "update-frequency", G_VARIANT_TYPE ("u"));
+
+      local_options = g_variant_dict_end (&local_options_dict);
+
+      /* TODO: Progress will yo-yo here. */
+      ostree_repo_pull_with_options (self, result->remote->name, local_options,
+                                     progress, cancellable, &local_error);
+
+      if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        {
+          ostree_repo_abort_transaction (self, NULL, NULL);
+          g_task_return_error (task, g_steal_pointer (&local_error));
+          return;
+        }
+      g_clear_error (&local_error);
+
+      for (j = 0; refs_to_pull->pdata[j] != NULL; j++)
+        g_hash_table_replace (refs_pulled, refs_to_pull->pdata[j],
+                              GINT_TO_POINTER (local_error == NULL));
+
+      if (local_error != NULL)
+        {
+          g_debug ("Failed to pull refs from ‘%s’: %s",
+                   result->remote->name, local_error->message);
+          g_clear_error (&local_error);
+          continue;
+        }
+      else
+        {
+          g_debug ("Pulled refs from ‘%s’.", result->remote->name);
+        }
+    }
+
+  /* Commit the transaction. */
+  if (!ostree_repo_commit_transaction (self, NULL, cancellable, &local_error))
+    {
+      g_task_return_error (task, g_steal_pointer (&local_error));
+      return;
+    }
+
+  /* Any refs left un-downloaded? If so, we’ve failed. */
+  g_hash_table_iter_init (&iter, refs_pulled);
+
+  while (g_hash_table_iter_next (&iter, (gpointer *) &ref, (gpointer *) &is_pulled_pointer))
+    {
+      gboolean is_pulled = GPOINTER_TO_INT (is_pulled_pointer);
+
+      if (is_pulled)
+        continue;
+
+      if (refs_unpulled_string == NULL)
+        refs_unpulled_string = g_string_new ("");
+      else
+        g_string_append (refs_unpulled_string, ", ");
+
+      g_string_append (refs_unpulled_string, ref);
+    }
+
+  if (refs_unpulled_string != NULL)
+    {
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                               "Failed to pull some refs from the remotes: %s",
+                               refs_unpulled_string->str);
+      return;
+    }
+
+  g_task_return_boolean (task, TRUE);
+}
+
+/**
+ * ostree_repo_pull_from_remotes_finish:
+ * @self: an #OstreeRepo
+ * @result: the asynchronous result
+ * @error: return location for a #GError, or %NULL
+ *
+ * Finish an asynchronous pull operation started with
+ * ostree_repo_pull_from_remotes_async().
+ *
+ * Returns: %TRUE on success, %FALSE otherwise
+ * Since: 2017.6
+ */
+gboolean
+ostree_repo_pull_from_remotes_finish (OstreeRepo    *self,
+                                      GAsyncResult  *result,
+                                      GError       **error)
+{
+  g_return_val_if_fail (OSTREE_IS_REPO (self), FALSE);
+  g_return_val_if_fail (g_task_is_valid (result, self), FALSE);
+  g_return_val_if_fail (g_async_result_is_tagged (result, ostree_repo_pull_from_remotes_async), FALSE);
+  g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
+
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+#endif /* OSTREE_ENABLE_EXPERIMENTAL_API */
 
 /**
  * ostree_repo_remote_fetch_summary_with_options:
