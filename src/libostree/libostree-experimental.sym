@@ -46,6 +46,7 @@ global:
   ostree_repo_finder_resolve_finish;
   ostree_repo_finder_result_compare;
   ostree_repo_finder_result_free;
+  ostree_repo_finder_result_freev;
   ostree_repo_finder_result_new;
   ostree_repo_pull_from_remotes_async;
   ostree_repo_pull_from_remotes_finish;

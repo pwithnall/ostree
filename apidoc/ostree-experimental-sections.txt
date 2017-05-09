@@ -16,6 +16,7 @@ OstreeRepoFinderResult
 ostree_repo_finder_result_new
 ostree_repo_finder_result_free
 ostree_repo_finder_result_compare
+ostree_repo_finder_result_freev
 <SUBSECTION Standard>
 ostree_repo_finder_get_type
 </SECTION>

@@ -3870,6 +3870,8 @@ static void find_remotes_cb (GObject      *obj,
  * will typically be all available finders using their default options (but
  * this is not guaranteed).
  *
+ * GPG verification of the summary and all commits will be used unconditionally.
+ *
  * This will use the thread-default #GMainContext, but will not iterate it.
  *
  * Since: 2017.6
@@ -3992,9 +3994,18 @@ find_remotes_cb (GObject      *obj,
       return;
     }
 
+  /* TODO: Add support for options:
+   *  - override-commit-ids (allow downgrades)
+   *
+   * Use case: multiple pulls of separate subdirs; want them to use the same
+   * configuration.
+   * Use case: downgrading a flatpak app.
+   */
+
   /* FIXME: In future, we also want to pull static delta superblocks in this
    * phase, so that we have all the metadata we need for accurate size
-   * estimation for the actual pull operation. */
+   * estimation for the actual pull operation. This should check the
+   * disable-static-deltas option first. */
 
   /* TODO: We currently do nothing with @progress. */
   /* TODO: think about security here: how can we secure this all? */
@@ -4156,9 +4167,11 @@ find_remotes_cb (GObject      *obj,
       if (!g_variant_lookup (additional_metadata_v, OSTREE_SUMMARY_LAST_MODIFIED, "t", &summary_last_modified))
         summary_last_modified = 0;
 
-      /* Update the stored result data. Clear the @refs array, since it’s been
-       * moved to @refs_and_remotes_table and is now potentially out of date. */
-      g_clear_pointer (&result->refs, g_strfreev);
+      /* Update the stored result data. Clear the @ref_to_checksum map, since
+       * it’s been moved to @refs_and_remotes_table and is now potentially out
+       * of date. */
+      g_clear_pointer (&result->ref_to_checksum, g_hash_table_unref);
+      /* TODO: ref_to_checksum doesn’t seem to be used at all above */
       result->summary_last_modified = summary_last_modified;
     }
 
@@ -4311,20 +4324,22 @@ find_remotes_cb (GObject      *obj,
   for (i = 0; i < results->len; i++)
     {
       OstreeRepoFinderResult *result = g_ptr_array_index (results, i);
-      g_autoptr(GPtrArray) validated_refs = NULL;
+      g_autoptr(GHashTable) validated_ref_to_checksum = NULL;  /* (element-type utf8 utf8) */
       gsize j;
 
-      validated_refs = g_ptr_array_new_with_free_func (g_free);
+      validated_ref_to_checksum = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
       for (j = 0; refs[j] != NULL; j++)
         {
           const gchar *latest_commit_for_ref = ref_to_latest_commit[j];
 
           if (pointer_table_get (refs_and_remotes_table, j, i) == latest_commit_for_ref)
-            g_ptr_array_add (validated_refs, g_strdup (refs[j]));
+            g_hash_table_insert (validated_ref_to_checksum, g_strdup (refs[j]), g_strdup (latest_commit_for_ref));
+          else
+            g_hash_table_insert (validated_ref_to_checksum, g_strdup (refs[j]), NULL);
         }
 
-      if (validated_refs->len == 0)
+      if (g_hash_table_size (validated_ref_to_checksum) == 0)
         {
           g_debug ("%s: Omitting remote ‘%s’ from results as none of its refs are new enough.",
                    G_STRFUNC, result->remote->name);
@@ -4332,8 +4347,7 @@ find_remotes_cb (GObject      *obj,
           continue;
         }
 
-      g_ptr_array_add (validated_refs, NULL);  /* NULL terminator */
-      result->refs = (gchar **) g_ptr_array_free (g_steal_pointer (&validated_refs), FALSE);
+      result->ref_to_checksum = g_steal_pointer (&validated_ref_to_checksum);
       g_ptr_array_add (final_results, g_steal_pointer (&g_ptr_array_index (results, i)));
     }
 
@@ -4423,6 +4437,10 @@ copy_option (GVariantDict       *master_options,
  * immediately. The results of any successfully completed downloads at that
  * point will remain cached in the local repository.
  *
+ * GPG verification of the summary and all commits will be used unconditionally.
+ *
+ * TODO: Document @options
+ *
  * Since: 2017.6
  */
 void
@@ -4443,6 +4461,8 @@ ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
   gpointer is_pulled_pointer;
   g_autoptr(GError) local_error = NULL;
   g_auto(GVariantDict) options_dict = OT_VARIANT_BUILDER_INITIALIZER;
+  OstreeRepoPullFlags flags;
+  gboolean inherit_transaction;
 
   /* Set up a task for the whole operation. */
   task = g_task_new (self, cancellable, callback, user_data);
@@ -4454,8 +4474,14 @@ ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
 
   g_variant_dict_init (&options_dict, options);
 
+  if (!g_variant_dict_lookup (&options_dict, "flags", "i", &flags))
+    flags = OSTREE_REPO_PULL_FLAGS_NONE;
+  if (!g_variant_dict_lookup (&options_dict, "inherit-transaction", "b", &inherit_transaction))
+    inherit_transaction = FALSE;
+
   /* Run all the local pull operations in a single overall transaction. */
-  if (!ostree_repo_prepare_transaction (self, NULL, cancellable, &local_error))
+  if (!inherit_transaction &&
+      !ostree_repo_prepare_transaction (self, NULL, cancellable, &local_error))
     {
       g_task_return_error (task, g_steal_pointer (&local_error));
       return;
@@ -4476,34 +4502,50 @@ ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
   for (i = 0; results[i] != NULL; i++)
     {
       const OstreeRepoFinderResult *result = results[i];
-      g_autoptr(GPtrArray) refs_to_pull = NULL;
+      g_autoptr(GPtrArray) refs_to_pull = NULL;  /* (element-type utf8) */
+      g_autoptr(GPtrArray) checksums_to_pull = NULL;  /* (element-type utf8) */
       g_auto(GVariantDict) local_options_dict = OT_VARIANT_BUILDER_INITIALIZER;
       g_autoptr(GVariant) local_options = NULL;
+      const gchar *checksum;
 
       refs_to_pull = g_ptr_array_new_with_free_func (NULL);
+      checksums_to_pull = g_ptr_array_new_with_free_func (NULL);
 
-      for (j = 0; result->refs[j] != NULL; j++)
-        if (!GPOINTER_TO_INT (g_hash_table_lookup (refs_pulled, result->refs[j])))
-          g_ptr_array_add (refs_to_pull, result->refs[j]);
+      g_hash_table_iter_init (&iter, result->ref_to_checksum);
 
-      if (refs_to_pull->len == 0)
+      while (g_hash_table_iter_next (&iter, (gpointer *) &ref, (gpointer *) &checksum))
+        {
+          if (checksum != NULL &&
+              !GPOINTER_TO_INT (g_hash_table_lookup (refs_pulled, ref)))
+            {
+              g_ptr_array_add (refs_to_pull, (gpointer) ref);
+              g_ptr_array_add (checksums_to_pull, (gpointer) checksum);
+            }
+        }
+
+      if (refs_to_pull->len == 0 || checksums_to_pull->len == 0)
         {
           g_debug ("Ignoring remote ‘%s’ as it has no relevent refs.",
                    result->remote->name);
           continue;
         }
 
-      /* NULL terminator. */
+      /* NULL terminators. */
       g_ptr_array_add (refs_to_pull, NULL);
+      g_ptr_array_add (checksums_to_pull, NULL);
 
       g_variant_dict_init (&local_options_dict, NULL);
 
-      g_variant_dict_insert (&local_options_dict, "flags", "i", OSTREE_REPO_PULL_FLAGS_UNTRUSTED);
+      g_variant_dict_insert (&local_options_dict, "flags", "i", OSTREE_REPO_PULL_FLAGS_UNTRUSTED | flags);
       g_variant_dict_insert (&local_options_dict, "refs", "^as", refs_to_pull->pdata);
+      g_variant_dict_insert (&local_options_dict, "override-commit-ids", "^as", checksums_to_pull->pdata);
       g_variant_dict_insert (&local_options_dict, "gpg-verify", "b", TRUE);
+      g_variant_dict_insert (&local_options_dict, "gpg-verify-summary", "b", TRUE);
       g_variant_dict_insert (&local_options_dict, "inherit-transaction", "b", TRUE);
       copy_option (&options_dict, &local_options_dict, "depth", G_VARIANT_TYPE ("i"));
+      copy_option (&options_dict, &local_options_dict, "disable-static-deltas", G_VARIANT_TYPE ("b"));
       copy_option (&options_dict, &local_options_dict, "http-headers", G_VARIANT_TYPE ("a(ss)"));
+      copy_option (&options_dict, &local_options_dict, "subdirs", G_VARIANT_TYPE ("as"));
       copy_option (&options_dict, &local_options_dict, "update-frequency", G_VARIANT_TYPE ("u"));
 
       local_options = g_variant_dict_end (&local_options_dict);
@@ -4514,7 +4556,8 @@ ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
 
       if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         {
-          ostree_repo_abort_transaction (self, NULL, NULL);
+          if (!inherit_transaction)
+            ostree_repo_abort_transaction (self, NULL, NULL);
           g_task_return_error (task, g_steal_pointer (&local_error));
           return;
         }
@@ -4538,7 +4581,8 @@ ostree_repo_pull_from_remotes_async (OstreeRepo                           *self,
     }
 
   /* Commit the transaction. */
-  if (!ostree_repo_commit_transaction (self, NULL, cancellable, &local_error))
+  if (!inherit_transaction &&
+      !ostree_repo_commit_transaction (self, NULL, cancellable, &local_error))
     {
       g_task_return_error (task, g_steal_pointer (&local_error));
       return;

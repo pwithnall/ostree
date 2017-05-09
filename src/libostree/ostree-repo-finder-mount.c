@@ -33,6 +33,7 @@
 #include <stdlib.h>
 
 #include "ostree-autocleanups.h"
+#include "ostree-remote-private.h"
 #include "ostree-repo-finder.h"
 #include "ostree-repo-finder-mount.h"
 
@@ -122,7 +123,7 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
       glnx_fd_close int repos_dfd = -1;
       gsize i;
       g_autoptr(GHashTable) repo_uri_to_refs = NULL;  /* (element-type utf8 GPtrArray) */
-      GPtrArray *supported_refs;  /* (element-type utf8) */
+      GHashTable *supported_ref_to_checksum;  /* (element-type utf8 utf8) */
       GHashTableIter iter;
       const gchar *repo_uri;
       g_autoptr(GError) local_error = NULL;
@@ -229,25 +230,23 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
           g_debug ("Resolved ref ‘%s’ on volume ‘%s’ to repo URI ‘%s’.",
                    refs[i], volume_name, resolved_repo_uri);
 
-          supported_refs = g_hash_table_lookup (repo_uri_to_refs, resolved_repo_uri);
+          supported_ref_to_checksum = g_hash_table_lookup (repo_uri_to_refs, resolved_repo_uri);
 
-          if (supported_refs == NULL)
+          if (supported_ref_to_checksum == NULL)
             {
-              supported_refs = g_ptr_array_new_with_free_func (NULL);
-              g_hash_table_insert (repo_uri_to_refs, g_steal_pointer (&resolved_repo_uri), supported_refs  /* transfer */);
+              supported_ref_to_checksum = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, NULL);
+              g_hash_table_insert (repo_uri_to_refs, g_steal_pointer (&resolved_repo_uri), supported_ref_to_checksum  /* transfer */);
             }
 
-          g_ptr_array_add (supported_refs, (gpointer) refs[i]);
+          g_hash_table_insert (supported_ref_to_checksum, (gpointer) refs[i], NULL);
         }
 
       /* Aggregate the results. */
       g_hash_table_iter_init (&iter, repo_uri_to_refs);
 
-      while (g_hash_table_iter_next (&iter, (gpointer *) &repo_uri, (gpointer *) &supported_refs))
+      while (g_hash_table_iter_next (&iter, (gpointer *) &repo_uri, (gpointer *) &supported_ref_to_checksum))
         {
           g_autoptr(OstreeRemote) remote = NULL;
-
-          g_ptr_array_add (supported_refs, NULL);  /* NULL terminator */
 
           remote = ostree_remote_new ();
           remote->name = g_strdup (repo_uri);
@@ -264,7 +263,7 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
            * the code in ostree_repo_pull_from_remotes_async() will be able to
            * check it just as quickly as we can here; so don’t duplicate the
            * code. */
-          g_ptr_array_add (results, ostree_repo_finder_result_new (remote, priority, (const gchar * const *) supported_refs->pdata, 0));
+          g_ptr_array_add (results, ostree_repo_finder_result_new (remote, priority, supported_ref_to_checksum, 0));
         }
     }
 

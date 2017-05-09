@@ -27,6 +27,7 @@
 #include <glib.h>
 #include <glib-object.h>
 
+#include "ostree-remote-private.h"
 #include "ostree-repo-finder.h"
 
 static void ostree_repo_finder_default_init (OstreeRepoFinderInterface *iface);
@@ -58,6 +59,39 @@ is_valid_ref_array (const gchar * const *refs)
   for (i = 0; refs[i] != NULL; i++)
     {
       if (!is_valid_ref_name (refs[i]))
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* TODO: Docs */
+static gboolean
+is_valid_checksum (const gchar *checksum)
+{
+  /* TODO */
+  return TRUE;
+}
+
+/* Validate @ref_to_checksum is non-%NULL, non-empty, and contains only valid
+ * ref names as keys and only valid commit checksums as values. */
+static gboolean
+is_valid_ref_map (GHashTable *ref_to_checksum)
+{
+  GHashTableIter iter;
+  const gchar *ref;
+  const gchar *checksum;
+
+  if (ref_to_checksum == NULL || g_hash_table_size (ref_to_checksum) == 0)
+    return FALSE;
+
+  g_hash_table_iter_init (&iter, ref_to_checksum);
+
+  while (g_hash_table_iter_next (&iter, (gpointer *) &ref, (gpointer *) &checksum))
+    {
+      if (!is_valid_ref_name (ref))
+        return FALSE;
+      if (!is_valid_checksum (checksum))
         return FALSE;
     }
 
@@ -343,7 +377,7 @@ ostree_repo_finder_resolve_all_finish (GAsyncResult  *result,
  * ostree_repo_finder_result_new:
  * @remote: (transfer none): TODO
  * @priority: TODO
- * @refs: (array zero-terminated=1): TODO
+ * @ref_to_checksum: (element-type utf8 utf8): TODO
  * @summary_last_modified: TODO
  *
  * TODO: Docs
@@ -354,18 +388,18 @@ ostree_repo_finder_resolve_all_finish (GAsyncResult  *result,
 OstreeRepoFinderResult *
 ostree_repo_finder_result_new (OstreeRemote        *remote,
                                gint                 priority,
-                               const gchar * const *refs,
+                               GHashTable          *ref_to_checksum,
                                guint64              summary_last_modified)
 {
   g_autoptr(OstreeRepoFinderResult) result = NULL;
 
   g_return_val_if_fail (remote != NULL, NULL);
-  g_return_val_if_fail (is_valid_ref_array (refs), NULL);
+  g_return_val_if_fail (is_valid_ref_map (ref_to_checksum), NULL);
 
   result = g_new0 (OstreeRepoFinderResult, 1);
   result->remote = ostree_remote_ref (remote);
   result->priority = priority;
-  result->refs = g_strdupv ((gchar **) refs);
+  result->ref_to_checksum = g_hash_table_ref (ref_to_checksum);
   result->summary_last_modified = summary_last_modified;
 
   return g_steal_pointer (&result);
@@ -402,8 +436,8 @@ ostree_repo_finder_result_compare (const OstreeRepoFinderResult *a,
       a->summary_last_modified != b->summary_last_modified)
     return a->summary_last_modified - b->summary_last_modified;
 
-  a_n_refs = g_strv_length (a->refs);
-  b_n_refs = g_strv_length (b->refs);
+  a_n_refs = g_hash_table_size (a->ref_to_checksum);
+  b_n_refs = g_hash_table_size (b->ref_to_checksum);
 
   if (a_n_refs != b_n_refs)
     return (gint) a_n_refs - (gint) b_n_refs;
@@ -424,7 +458,27 @@ ostree_repo_finder_result_free (OstreeRepoFinderResult *result)
 {
   g_return_if_fail (result != NULL);
 
-  g_strfreev (result->refs);
+  g_hash_table_unref (result->ref_to_checksum);
   ostree_remote_unref (result->remote);
   g_free (result);
 }
+
+/**
+ * ostree_repo_finder_result_freev:
+ * @results: (array zero-terminated=1) (transfer full): an #OstreeRepoFinderResult
+ *
+ * Free the given @results array, freeing each element and the container.
+ *
+ * Since: 2017.6
+ */
+void
+ostree_repo_finder_result_freev (OstreeRepoFinderResult **results)
+{
+  gsize i;
+
+  for (i = 0; results[i] != NULL; i++)
+    ostree_repo_finder_result_free (results[i]);
+
+  g_free (results);
+}
+

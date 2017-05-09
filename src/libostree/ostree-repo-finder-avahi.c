@@ -43,6 +43,7 @@
 
 #include "ostree-autocleanups.h"
 #include "ostree-bloom-private.h"
+#include "ostree-remote-private.h"
 #include "ostree-repo-finder.h"
 #include "ostree-repo-finder-avahi.h"
 #include "ostree-repo-finder-avahi-private.h"
@@ -381,6 +382,20 @@ bloom_refs_intersection (GVariant            *bloom_encoded,
   return g_steal_pointer (&possible_refs);
 }
 
+static GHashTable *
+ptr_array_to_hash_table_keys (GPtrArray *array)
+{
+  g_autoptr(GHashTable) table = NULL;
+  gsize i;
+
+  table = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, NULL);
+
+  for (i = 0; i < array->len && array->pdata[i] != NULL; i++)
+    g_hash_table_insert (table, g_ptr_array_index (array, i), NULL);
+
+  return g_steal_pointer (&table);
+}
+
 /* TODO: docs
 
 v=1
@@ -399,6 +414,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService  *self,
   g_autoptr(GVariant) repo_index = NULL;
   g_autofree gchar *repo_path = NULL;
   g_autoptr(GPtrArray) possible_refs = NULL;
+  g_autoptr(GHashTable) possible_ref_to_checksum = NULL;  /* (element-type utf8 NULL) */
   SoupURI *_uri = NULL;
   g_autofree gchar *uri = NULL;
 
@@ -461,8 +477,12 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService  *self,
   g_key_file_set_boolean (remote->options, remote->group, "gpg-verify", TRUE);
   g_key_file_set_boolean (remote->options, remote->group, "gpg-verify-summary", TRUE);
 
+  /* FIXME: This must not return NULL checksums */
+  if (possible_refs != NULL)
+    possible_ref_to_checksum = ptr_array_to_hash_table_keys (possible_refs);
+
   return ostree_repo_finder_result_new (remote, priority,
-                                        (possible_refs != NULL) ? (const gchar * const *) possible_refs->pdata : NULL,
+                                        possible_ref_to_checksum,
                                         (summary_timestamp != NULL) ? g_variant_get_uint64 (summary_timestamp) : 0);
 }
 

@@ -28,6 +28,7 @@
 #include <glib-object.h>
 #include <locale.h>
 
+#include "ostree-remote-private.h"
 #include "ostree-repo-finder.h"
 #include "ostree-repo-finder-mount.h"
 #include "test-mock-gio.h"
@@ -342,26 +343,27 @@ test_repo_finder_mount_mixed_mounts (Fixture       *fixture,
       uri = g_key_file_get_string (result->remote->options, result->remote->group, "url", &error);
       g_assert_no_error (error);
 
+      /* TODO: Check the checksums too */
       if (g_strcmp0 (result->remote->name, repo1_repo_a_uri) == 0)
         {
           g_assert_cmpstr (uri, ==, repo1_repo_a_uri);
-          g_assert_cmpuint (g_strv_length (result->refs), ==, 2);
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[0]));
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[2]));
+          g_assert_cmpuint (g_hash_table_size (result->ref_to_checksum), ==, 2);
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[0]));
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[2]));
         }
       else if (g_strcmp0 (result->remote->name, repo1_repo_b_uri) == 0)
         {
           g_assert_cmpstr (uri, ==, repo1_repo_b_uri);
-          g_assert_cmpuint (g_strv_length (result->refs), ==, 1);
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[1]));
+          g_assert_cmpuint (g_hash_table_size (result->ref_to_checksum), ==, 1);
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[1]));
         }
       else if (g_strcmp0 (result->remote->name, repo2_repo_a_uri) == 0)
         {
           g_assert_cmpstr (uri, ==, repo2_repo_a_uri);
-          g_assert_cmpuint (g_strv_length (result->refs), ==, 3);
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[0]));
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[1]));
-          g_assert_true (g_strv_contains ((const gchar * const *) result->refs, refs[2]));
+          g_assert_cmpuint (g_hash_table_size (result->ref_to_checksum), ==, 3);
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[0]));
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[1]));
+          g_assert_true (g_hash_table_contains (result->ref_to_checksum, refs[2]));
         }
       else
         {

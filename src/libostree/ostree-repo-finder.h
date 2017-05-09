@@ -27,7 +27,7 @@
 #include <glib.h>
 #include <glib-object.h>
 
-#include "ostree-remote-private.h"
+#include "ostree-remote.h"
 #include "ostree-types.h"
 
 G_BEGIN_DECLS
@@ -74,11 +74,14 @@ GPtrArray *ostree_repo_finder_resolve_all_finish (GAsyncResult  *result,
 
 /**
  * OstreeRepoFinderResult:
- * @uri: TODO
+ * @remote: TODO
  * @priority: TODO
+ * @ref_to_checksum: TODO
+ * @summary_last_modified: TODO
  *
  * TODO: basically a structure which says ‘you can download these refs from
- * this URI, and they will be up to date’, along with some relevant metadata.
+ * this URI, and they will be up to date (or the given version)’, along with
+ * some relevant metadata.
  *
  * Since: 2017.6
  */
@@ -87,20 +90,19 @@ typedef struct
   /* TODO: Ensure that this API could be extended to support torrenting in future. */
   OstreeRemote *remote;
   gint priority;
-  gchar **refs;  /* refs which are in this remote, unique, in ascending lexicographic order TODO enforce this*/
+  GHashTable *ref_to_checksum;  /* (element-type utf8 utf8) value is (nullable) to indicate a missing ref */
   guint64 summary_last_modified;
 
   /*< private >*/
   gpointer padding[4];
 } OstreeRepoFinderResult;
 
-
 /* TODO: Make OstreeRepoFinderResult introspectable. */
 
 _OSTREE_PUBLIC
 OstreeRepoFinderResult *ostree_repo_finder_result_new (OstreeRemote        *remote,
                                                        gint                 priority,
-                                                       const gchar * const *refs,
+                                                       GHashTable          *ref_to_checksum,
                                                        guint64              summary_last_modified);
 
 _OSTREE_PUBLIC
@@ -110,6 +112,13 @@ gint ostree_repo_finder_result_compare (const OstreeRepoFinderResult *a,
 _OSTREE_PUBLIC
 void ostree_repo_finder_result_free (OstreeRepoFinderResult *result);
 
+/* TODO: Docs */
+typedef OstreeRepoFinderResult** OstreeRepoFinderResultv;
+
+_OSTREE_PUBLIC
+void ostree_repo_finder_result_freev (OstreeRepoFinderResult **result);
+
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (OstreeRepoFinderResult, ostree_repo_finder_result_free)
+G_DEFINE_AUTO_CLEANUP_FREE_FUNC (OstreeRepoFinderResultv, ostree_repo_finder_result_freev, NULL)
 
 G_END_DECLS

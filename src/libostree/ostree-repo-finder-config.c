@@ -94,8 +94,8 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
   g_autoptr(GPtrArray) results = NULL;
   const gint priority = 100;  /* arbitrarily chosen; lower than the others */
   gsize i, j;
-  g_autoptr(GHashTable) repo_name_to_refs = NULL;  /* (element-type utf8 GPtrArray) */
-  GPtrArray *supported_refs;  /* (element-type utf8) */
+  g_autoptr(GHashTable) repo_name_to_refs = NULL;  /* (element-type utf8 GHashTable) */
+  GHashTable *supported_ref_to_checksum;  /* (element-type utf8 utf8) */
   GHashTableIter iter;
   const gchar *remote_name;
   g_auto(GStrv) remotes = NULL;
@@ -104,8 +104,8 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
   task = g_task_new (finder, cancellable, callback, user_data);
   g_task_set_source_tag (task, ostree_repo_finder_config_resolve_async);
   results = g_ptr_array_new_with_free_func ((GDestroyNotify) ostree_repo_finder_result_free);
-  repo_name_to_refs = g_hash_table_new_full (g_str_hash, g_str_equal,
-                                            NULL, (GDestroyNotify) g_ptr_array_unref);
+  repo_name_to_refs = g_hash_table_new_full (g_str_hash, g_str_equal, NULL,
+                                             (GDestroyNotify) g_hash_table_unref);
 
   /* List all remotes in this #OstreeRepo and see which of their ref lists
    * intersect with @refs. */
@@ -115,6 +115,7 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
     {
       g_autoptr(GError) local_error = NULL;
       g_autoptr(GHashTable) remote_refs = NULL;  /* (element-type utf8 utf8) */
+      const gchar *checksum;
 
       remote_name = remotes[i];
 
@@ -129,23 +130,24 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
 
       for (j = 0; refs[j] != NULL; j++)
         {
-          if (g_hash_table_contains (remote_refs, refs[j]))
+          if (g_hash_table_lookup_extended (remote_refs, refs[j], NULL, (gpointer *) &checksum))
             {
               /* The requested ref is listed in the refs for this remote. Add
                * the remote to the results, and the ref to its
-               * @supported_refs.. */
+               * @supported_ref_to_checksum. */
               g_debug ("Resolved ref ‘%s’ to remote ‘%s’.",
                        refs[j], remote_name);
 
-              supported_refs = g_hash_table_lookup (repo_name_to_refs, remote_name);
+              supported_ref_to_checksum = g_hash_table_lookup (repo_name_to_refs, remote_name);
 
-              if (supported_refs == NULL)
+              if (supported_ref_to_checksum == NULL)
                 {
-                  supported_refs = g_ptr_array_new_with_free_func (NULL);
-                  g_hash_table_insert (repo_name_to_refs, (gpointer) remote_name, supported_refs  /* transfer */);
+                  supported_ref_to_checksum = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, g_free);
+                  g_hash_table_insert (repo_name_to_refs, (gpointer) remote_name, supported_ref_to_checksum  /* transfer */);
                 }
 
-              g_ptr_array_add (supported_refs, (gpointer) refs[j]);
+              g_hash_table_insert (supported_ref_to_checksum,
+                                   (gpointer) refs[j], g_strdup (checksum));
             }
         }
     }
@@ -153,18 +155,16 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
   /* Aggregate the results. */
   g_hash_table_iter_init (&iter, repo_name_to_refs);
 
-  while (g_hash_table_iter_next (&iter, (gpointer *) &remote_name, (gpointer *) &supported_refs))
+  while (g_hash_table_iter_next (&iter, (gpointer *) &remote_name, (gpointer *) &supported_ref_to_checksum))
     {
       g_autoptr(GError) local_error = NULL;
       OstreeRemote *remote;
 
-      g_ptr_array_add (supported_refs, NULL);  /* NULL terminator */
-
       /* We don’t know what last-modified timestamp the remote has without
        * making expensive HTTP queries, so leave that information blank. We
-       * assume that the configuration which says these @supported_refs are in
-       * the repository is correct; the code in ostree_repo_find_remotes_async()
-       * will check that. */
+       * assume that the configuration which says the refs and commits in
+       * @supported_ref_to_checksum are in the repository is correct; the code
+       * in ostree_repo_find_remotes_async() will check that. */
       remote = _ostree_repo_get_remote_inherited (self->repo, remote_name, &local_error);
       if (remote == NULL)
         {
@@ -173,7 +173,7 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
           continue;
         }
 
-      g_ptr_array_add (results, ostree_repo_finder_result_new (remote, priority, (const gchar * const *) supported_refs->pdata, 0));
+      g_ptr_array_add (results, ostree_repo_finder_result_new (remote, priority, supported_ref_to_checksum, 0));
     }
 
   g_task_return_pointer (task, g_steal_pointer (&results), (GDestroyNotify) g_ptr_array_unref);

@@ -28,6 +28,8 @@
 #include "ostree.h"
 #include "otutil.h"
 
+#include "ostree-remote-private.h"
+
 static gchar *opt_cache_dir = NULL;
 static gboolean opt_disable_fsync = FALSE;
 static gboolean opt_pull = FALSE;
@@ -40,22 +42,6 @@ static GOptionEntry options[] =
     { NULL }
   };
 
-/* TODO: Move this into ostree-repo.h? */
-typedef OstreeRepoFinderResult* RepoFinderResultArray;
-
-static void
-repo_finder_result_array_free (RepoFinderResultArray *array)
-{
-  gsize i;
-
-  for (i = 0; array[i] != NULL; i++)
-    ostree_repo_finder_result_free (array[i]);
-
-  g_free (array);
-}
-
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(RepoFinderResultArray, repo_finder_result_array_free)
-
 static gchar *
 uint64_secs_to_iso8601 (guint64 secs)
 {
@@ -65,6 +51,23 @@ uint64_secs_to_iso8601 (guint64 secs)
     return g_date_time_format (dt, "%FT%TZ");
   else
     return g_strdup ("invalid");
+}
+
+static gchar *
+format_ref_to_checksum (GHashTable  *ref_to_checksum,
+                        const gchar *line_prefix)
+{
+  GHashTableIter iter;
+  const gchar *ref, *checksum;
+  g_autoptr(GString) out = NULL;
+
+  g_hash_table_iter_init (&iter, ref_to_checksum);
+  out = g_string_new ("");
+
+  while (g_hash_table_iter_next (&iter, (gpointer *) &ref, (gpointer *) &checksum))
+    g_string_append_printf (out, "%s - %s = %s\n", line_prefix, ref, checksum);
+
+  return g_string_free (g_steal_pointer (&out), FALSE);
 }
 
 /* TODO: Move to ostree-remote.c? */
@@ -102,7 +105,7 @@ ostree_builtin_find_remotes (int            argc,
   glnx_unref_object OstreeAsyncProgress *progress = NULL;
   gsize i;
   g_autoptr(GAsyncResult) find_result = NULL, pull_result = NULL;
-  g_autoptr(RepoFinderResultArray) results = NULL;
+  g_auto(OstreeRepoFinderResultv) results = NULL;
   g_auto(GLnxConsoleRef) console = { 0, };
 
   context = g_option_context_new ("REF [REF...] - Find remotes to serve the given refs");
@@ -167,7 +170,7 @@ ostree_builtin_find_remotes (int            argc,
       g_autofree gchar *last_modified_string = NULL;
 
       uri = remote_get_uri (results[i]->remote);
-      refs_string = g_strjoinv ("\n  - ", results[i]->refs);
+      refs_string = format_ref_to_checksum (results[i]->ref_to_checksum, "   ");
 
       if (results[i]->summary_last_modified > 0)
         last_modified_string = uint64_secs_to_iso8601 (results[i]->summary_last_modified);
@@ -178,7 +181,7 @@ ostree_builtin_find_remotes (int            argc,
                " - Priority: %d\n"
                " - Summary last modified: %s\n"
                " - Refs:\n"
-               "  - %s\n",
+               "%s\n",
                i, uri, results[i]->priority, last_modified_string, refs_string);
     }
 
