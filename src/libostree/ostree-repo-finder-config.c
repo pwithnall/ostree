@@ -173,7 +173,7 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
           continue;
         }
 
-      g_ptr_array_add (results, ostree_repo_finder_result_new (remote, priority, supported_ref_to_checksum, 0));
+      g_ptr_array_add (results, ostree_repo_finder_result_new (remote, finder, priority, supported_ref_to_checksum, 0));
     }
 
   g_task_return_pointer (task, g_steal_pointer (&results), (GDestroyNotify) g_ptr_array_unref);

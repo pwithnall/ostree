@@ -89,6 +89,7 @@ typedef struct
 {
   /* TODO: Ensure that this API could be extended to support torrenting in future. */
   OstreeRemote *remote;
+  OstreeRepoFinder *finder;
   gint priority;
   GHashTable *ref_to_checksum;  /* (element-type utf8 utf8) value is (nullable) to indicate a missing ref */
   guint64 summary_last_modified;
@@ -101,6 +102,7 @@ typedef struct
 
 _OSTREE_PUBLIC
 OstreeRepoFinderResult *ostree_repo_finder_result_new (OstreeRemote        *remote,
+                                                       OstreeRepoFinder    *finder,
                                                        gint                 priority,
                                                        GHashTable          *ref_to_checksum,
                                                        guint64              summary_last_modified);

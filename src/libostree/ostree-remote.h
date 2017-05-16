@@ -53,4 +53,7 @@ OstreeRemote *ostree_remote_ref (OstreeRemote *remote);
 _OSTREE_PUBLIC
 void ostree_remote_unref (OstreeRemote *remote);
 
+_OSTREE_PUBLIC
+const gchar *ostree_remote_get_name (OstreeRemote *remote);
+
 G_END_DECLS

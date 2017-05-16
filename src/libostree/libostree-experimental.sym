@@ -26,6 +26,7 @@
 
 LIBOSTREE_2017.6_EXPERIMENTAL {
 global:
+  ostree_remote_get_name;
   ostree_remote_ref;
   ostree_remote_unref;
   ostree_repo_find_remotes_async;

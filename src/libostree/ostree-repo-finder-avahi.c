@@ -403,9 +403,10 @@ rb=refs bloom filter
 st=summary timestamp
 */
 static OstreeRepoFinderResult *
-ostree_avahi_service_build_repo_finder_result (OstreeAvahiService  *self,
-                                               gint                 priority,
-                                               const gchar * const *refs)
+ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
+                                               OstreeRepoFinderAvahi *finder,
+                                               gint                   priority,
+                                               const gchar * const   *refs)
 {
   g_autoptr(GHashTable) attributes = NULL;
   g_autoptr(GVariant) version = NULL;
@@ -481,7 +482,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService  *self,
   if (possible_refs != NULL)
     possible_ref_to_checksum = ptr_array_to_hash_table_keys (possible_refs);
 
-  return ostree_repo_finder_result_new (remote, priority,
+  return ostree_repo_finder_result_new (remote, OSTREE_REPO_FINDER (finder), priority,
                                         possible_ref_to_checksum,
                                         (summary_timestamp != NULL) ? g_variant_get_uint64 (summary_timestamp) : 0);
 }
@@ -587,7 +588,7 @@ complete_all_pending_tasks (OstreeRepoFinderAvahi *self)
           OstreeAvahiService *service = g_ptr_array_index (self->found_services, j);
           g_autoptr(OstreeRepoFinderResult) result = NULL;
 
-          result = ostree_avahi_service_build_repo_finder_result (service, priority, refs);
+          result = ostree_avahi_service_build_repo_finder_result (service, self, priority, refs);
           g_ptr_array_add (results, g_steal_pointer (&result));
         }
 

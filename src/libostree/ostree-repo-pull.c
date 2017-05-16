@@ -3908,6 +3908,9 @@ ostree_repo_find_remotes_async (OstreeRepo           *self,
 
   context = g_main_context_get_thread_default ();
 
+  /* TODO: Add an option to disable checking for the latest commit, so we can
+   * support appstream/$arch branches. */
+
   /* Are we using #OstreeRepoFinders provided by the user, or the defaults? */
   if (finders == NULL)
     {
