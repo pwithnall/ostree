@@ -56,7 +56,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (AvahiServiceBrowser, avahi_service_browser_free)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AvahiServiceResolver, avahi_service_resolver_free)
 
 /* FIXME: Register this with IANA? https://tools.ietf.org/html/rfc6335#section-5.2 */
-const gchar * const OSTREE_AVAHI_SERVICE_TYPE = "_repo._ostree._tcp";
+const gchar * const OSTREE_AVAHI_SERVICE_TYPE = "_ostree_repo._tcp";
 
 static const gchar *
 ostree_avahi_client_state_to_string (AvahiClientState state)
