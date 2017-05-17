@@ -351,7 +351,7 @@ bloom_refs_intersection (GVariant            *bloom_encoded,
   gsize i;
   g_autoptr(GPtrArray) possible_refs = NULL;
 
-  g_variant_get (bloom_encoded, "yy@ay", &k, &hash_id, &bloom_variant);
+  g_variant_get (bloom_encoded, "(yy@ay)", &k, &hash_id, &bloom_variant);
 
   if (k == 0)
     return NULL;
@@ -435,7 +435,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
     }
 
   /* Refs bloom filter? */
-  bloom = _ostree_txt_records_lookup_variant (attributes, "rb", G_VARIANT_TYPE ("yyay"));
+  bloom = _ostree_txt_records_lookup_variant (attributes, "rb", G_VARIANT_TYPE ("(yyay)"));
 
   if (bloom != NULL)
     {
