@@ -56,7 +56,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (AvahiServiceBrowser, avahi_service_browser_free)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (AvahiServiceResolver, avahi_service_resolver_free)
 
 /* FIXME: Register this with IANA? https://tools.ietf.org/html/rfc6335#section-5.2 */
-const gchar * const OSTREE_AVAHI_SERVICE_TYPE = "_repo._ostree._tcp";
+const gchar * const OSTREE_AVAHI_SERVICE_TYPE = "_ostree_repo._tcp";
 
 static const gchar *
 ostree_avahi_client_state_to_string (AvahiClientState state)
@@ -351,7 +351,7 @@ bloom_refs_intersection (GVariant            *bloom_encoded,
   gsize i;
   g_autoptr(GPtrArray) possible_refs = NULL;
 
-  g_variant_get (bloom_encoded, "yy@ay", &k, &hash_id, &bloom_variant);
+  g_variant_get (bloom_encoded, "(yy@ay)", &k, &hash_id, &bloom_variant);
 
   if (k == 0)
     return NULL;
@@ -435,7 +435,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
     }
 
   /* Refs bloom filter? */
-  bloom = _ostree_txt_records_lookup_variant (attributes, "rb", G_VARIANT_TYPE ("yyay"));
+  bloom = _ostree_txt_records_lookup_variant (attributes, "rb", G_VARIANT_TYPE ("(yyay)"));
 
   if (bloom != NULL)
     {
@@ -470,7 +470,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
   /* Build an #OstreeRemote. Use the hash of the URI, since remote->name
    * is used in file paths, so needs to not contain special characters. */
   g_autofree gchar *name = g_compute_checksum_for_string (G_CHECKSUM_MD5, uri, -1);
-  g_autofree gchar *group = g_strdup_printf ("[remote \"%s\"]", name);
+  g_autofree gchar *group = g_strdup_printf ("remote \"%s\"", name);
   remote = ostree_remote_new (name, group);
 
   g_key_file_set_string (remote->options, remote->group, "url", uri);
@@ -588,7 +588,8 @@ complete_all_pending_tasks (OstreeRepoFinderAvahi *self)
           g_autoptr(OstreeRepoFinderResult) result = NULL;
 
           result = ostree_avahi_service_build_repo_finder_result (service, self, priority, refs);
-          g_ptr_array_add (results, g_steal_pointer (&result));
+          if (result != NULL)
+            g_ptr_array_add (results, g_steal_pointer (&result));
         }
 
       g_task_return_pointer (task, g_steal_pointer (&results), (GDestroyNotify) g_ptr_array_unref);
