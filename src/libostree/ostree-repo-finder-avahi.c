@@ -470,7 +470,7 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
   /* Build an #OstreeRemote. Use the hash of the URI, since remote->name
    * is used in file paths, so needs to not contain special characters. */
   g_autofree gchar *name = g_compute_checksum_for_string (G_CHECKSUM_MD5, uri, -1);
-  g_autofree gchar *group = g_strdup_printf ("[remote \"%s\"]", name);
+  g_autofree gchar *group = g_strdup_printf ("remote \"%s\"", name);
   remote = ostree_remote_new (name, group);
 
   g_key_file_set_string (remote->options, remote->group, "url", uri);
