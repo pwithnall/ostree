@@ -351,9 +351,12 @@ gboolean
 _ostree_repo_update_mtime (OstreeRepo        *self,
                            GError           **error);
 
-void
+gboolean
 _ostree_repo_add_remote (OstreeRepo   *self,
                          OstreeRemote *remote);
+gboolean
+_ostree_repo_remove_remote (OstreeRepo   *self,
+                            OstreeRemote *remote);
 OstreeRemote *
 _ostree_repo_get_remote (OstreeRepo  *self,
                          const char  *name,

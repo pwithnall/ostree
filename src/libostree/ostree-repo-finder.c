@@ -258,10 +258,24 @@ ostree_repo_finder_resolve_all_async (OstreeRepoFinder * const *finders,
   g_autoptr(GTask) task = NULL;
   g_autoptr(ResolveAllData) data = NULL;
   gsize i;
+  g_autofree gchar *refs_str = NULL;
+  g_autoptr(GString) finders_str = NULL;
 
   g_return_if_fail (finders != NULL && finders[0] != NULL);
   g_return_if_fail (is_valid_ref_array (refs));
   g_return_if_fail (cancellable == NULL || G_IS_CANCELLABLE (cancellable));
+
+  refs_str = g_strjoinv (", ", (gchar **) refs);
+  finders_str = g_string_new ("");
+  for (i = 0; finders[i] != NULL; i++)
+    {
+      if (i != 0)
+        g_string_append (finders_str, ", ");
+      g_string_append (finders_str, g_type_name (G_TYPE_FROM_INSTANCE (finders[i])));
+    }
+
+  g_debug ("%s: Resolving refs [%s] with finders [%s]", G_STRFUNC,
+           refs_str, finders_str->str);
 
   task = g_task_new (NULL, cancellable, callback, user_data);
   g_task_set_source_tag (task, ostree_repo_finder_resolve_all_async);
@@ -347,7 +361,25 @@ resolve_all_finished_one (GTask *task)
 
   if (data->n_finders_pending == 0)
     {
+      gsize i;
+      g_autoptr(GString) results_str = NULL;
+
       g_ptr_array_sort (data->results, sort_results_cb);
+
+      results_str = g_string_new ("");
+      for (i = 0; i < data->results->len; i++)
+        {
+          const OstreeRepoFinderResult *result = g_ptr_array_index (data->results, i);
+
+          if (i != 0)
+            g_string_append (results_str, ", ");
+          g_string_append (results_str, ostree_remote_get_name (result->remote));
+        }
+      if (i == 0)
+        g_string_append (results_str, "(none)");
+
+      g_debug ("%s: Finished, results: %s", G_STRFUNC, results_str->str);
+
       g_task_return_pointer (task, g_steal_pointer (&data->results), (GDestroyNotify) g_ptr_array_unref);
     }
 }

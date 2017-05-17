@@ -111,6 +111,8 @@ ostree_repo_finder_config_resolve_async (OstreeRepoFinder    *finder,
    * intersect with @refs. */
   remotes = ostree_repo_remote_list (self->repo, (guint *) &n_remotes);
 
+  g_debug ("%s: Checking %" G_GSIZE_FORMAT " remotes", G_STRFUNC, n_remotes);
+
   for (i = 0; i < n_remotes; i++)
     {
       g_autoptr(GError) local_error = NULL;

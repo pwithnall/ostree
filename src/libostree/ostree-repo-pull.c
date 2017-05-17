@@ -3972,6 +3972,7 @@ find_remotes_cb (GObject      *obj,
   g_autofree const gchar **ref_to_latest_commit = NULL;  /* indexed as @refs; (element-type commit-checksum) */
   gsize n_refs;
   const gchar *checksum;
+  g_autoptr(GPtrArray) remotes_to_remove = NULL;  /* (element-type OstreeRemote) */
 
   task = G_TASK (user_data);
   self = OSTREE_REPO (g_task_get_source_object (task));
@@ -3997,6 +3998,9 @@ find_remotes_cb (GObject      *obj,
       return;
     }
 
+  /* TODO: Pre-processing step which sets the right keyring for each
+   * result->remote if it’s not already set. */
+
   /* TODO: Add support for options:
    *  - override-commit-ids (allow downgrades)
    *
@@ -4020,6 +4024,7 @@ find_remotes_cb (GObject      *obj,
    * remote, or %NULL if the remote doesn’t have that ref. */
   n_refs = g_strv_length ((gchar **) refs);
   refs_and_remotes_table = pointer_table_new (n_refs, results->len);
+  remotes_to_remove = g_ptr_array_new_with_free_func (NULL);
 
   /* Fetch and validate the summary file for each result. */
   /* FIXME: All these downloads could be parallelised; that requires the
@@ -4034,6 +4039,11 @@ find_remotes_cb (GObject      *obj,
       g_autoptr(GVariant) summary_refs = NULL;
       gsize n, j;
       g_autoptr(GVariant) additional_metadata_v = NULL;
+
+      /* Add the remote to our internal list of remotes, so other libostree
+       * API can access it. */
+      if (!_ostree_repo_add_remote (self, result->remote))
+        g_ptr_array_add (remotes_to_remove, result->remote);
 
       g_debug ("%s: Fetching summary for remote ‘%s’.",
                G_STRFUNC, result->remote->name);
@@ -4051,12 +4061,12 @@ find_remotes_cb (GObject      *obj,
       if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         {
           g_task_return_error (task, g_steal_pointer (&error));
-          return;
+          goto out;
         }
       else if (error != NULL)
         {
-          g_debug ("%s: Failed to download summary for result ‘%s’. Ignoring.",
-                   G_STRFUNC, result->remote->name);
+          g_debug ("%s: Failed to download summary for result ‘%s’. Ignoring. %s",
+                   G_STRFUNC, result->remote->name, error->message);
           /* TODO: Not sure this g_clear_pointer() call is safe. */
           g_clear_pointer (&g_ptr_array_index (results, i), (GDestroyNotify) ostree_repo_finder_result_free);
           g_clear_error (&error);
@@ -4217,9 +4227,14 @@ find_remotes_cb (GObject      *obj,
 
           for (j = 0; j < results->len; j++)
             {
+              OstreeRepoFinderResult *result = g_ptr_array_index (results, j);
+
+              /* Previous error processing this result? */
+              if (result == NULL)
+                continue;
+
               if (pointer_table_get (refs_and_remotes_table, ref_index, j) == commit_metadata->checksum)
                 {
-                  OstreeRepoFinderResult *result = g_ptr_array_index (results, j);
                   g_autofree gchar *uri = NULL;
                   g_autoptr(OstreeFetcherURI) fetcher_uri = NULL;
 
@@ -4227,14 +4242,14 @@ find_remotes_cb (GObject      *obj,
                                                    &uri, &error))
                     {
                       g_task_return_error (task, g_steal_pointer (&error));
-                      return;
+                      goto out;
                     }
 
                   fetcher_uri = _ostree_fetcher_uri_parse (uri, &error);
                   if (fetcher_uri == NULL)
                     {
                       g_task_return_error (task, g_steal_pointer (&error));
-                      return;
+                      goto out;
                     }
 
                   g_ptr_array_add (mirrorlist, g_steal_pointer (&fetcher_uri));
@@ -4256,7 +4271,7 @@ find_remotes_cb (GObject      *obj,
                                                        &error))
         {
           g_task_return_error (task, g_steal_pointer (&error));
-          return;
+          goto out;
         }
 
       /* Parse the commit metadata. */
@@ -4312,11 +4327,21 @@ find_remotes_cb (GObject      *obj,
             }
         }
 
+      /* This could be %NULL if there was an error downloading the summary or
+       * commitmeta files above. */
       ref_to_latest_commit[i] = latest_checksum;
 
-      latest_commit_timestamp_str = uint64_secs_to_iso8601 (latest_commit_metadata->timestamp);
-      g_debug ("%s: Latest commit for ref ‘%s’ across all remotes is ‘%s’ with timestamp %s.",
-               G_STRFUNC, refs[i], latest_checksum, latest_commit_timestamp_str);
+      if (latest_commit_metadata != NULL)
+        {
+          latest_commit_timestamp_str = uint64_secs_to_iso8601 (latest_commit_metadata->timestamp);
+          g_debug ("%s: Latest commit for ref ‘%s’ across all remotes is ‘%s’ with timestamp %s.",
+                   G_STRFUNC, refs[i], latest_checksum, latest_commit_timestamp_str);
+        }
+      else
+        {
+          g_debug ("%s: Latest commit for ref ‘%s’ is unknown due to failure to download metadata.",
+                   G_STRFUNC, refs[i]);
+        }
     }
 
   /* Recombine @commit_metadatas and @results so that each
@@ -4329,6 +4354,10 @@ find_remotes_cb (GObject      *obj,
       OstreeRepoFinderResult *result = g_ptr_array_index (results, i);
       g_autoptr(GHashTable) validated_ref_to_checksum = NULL;  /* (element-type utf8 utf8) */
       gsize j;
+
+      /* Previous error processing this result? */
+      if (result == NULL)
+        continue;
 
       validated_ref_to_checksum = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
@@ -4361,7 +4390,26 @@ find_remotes_cb (GObject      *obj,
   g_ptr_array_sort (final_results, sort_results_cb);
   g_ptr_array_add (final_results, NULL);  /* NULL terminator */
 
+  /* Remove the remotes we temporarily added.
+   * FIXME: It would be so much better if we could pass #OstreeRemote pointers
+   * around internally, to avoid serialising on the global table of them. */
+  for (i = 0; i < remotes_to_remove->len; i++)
+    {
+      OstreeRemote *remote = g_ptr_array_index (remotes_to_remove, i);
+      _ostree_repo_remove_remote (self, remote);
+    }
+
   g_task_return_pointer (task, g_steal_pointer (&final_results), (GDestroyNotify) g_ptr_array_unref);
+
+  return;
+
+out:
+  /* Remove the remotes we temporarily added. */
+  for (i = 0; i < remotes_to_remove->len; i++)
+    {
+      OstreeRemote *remote = g_ptr_array_index (remotes_to_remove, i);
+      _ostree_repo_remove_remote (self, remote);
+    }
 }
 
 /* TODO: How do we report that the local commit for a ref is already the latest? */

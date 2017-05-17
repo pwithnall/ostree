@@ -467,12 +467,11 @@ ostree_avahi_service_build_repo_finder_result (OstreeAvahiService    *self,
   /* Build the URI into a remote. */
   g_autoptr(OstreeRemote) remote = NULL;
 
-  remote = ostree_remote_new ();
-  remote->name = g_strdup (uri);
-  remote->group = g_strdup_printf ("[remote \"%s\"]", remote->name);
-  remote->keyring = NULL;
-  remote->file = NULL;
-  remote->options = g_key_file_new ();
+  /* Build an #OstreeRemote. Use the hash of the URI, since remote->name
+   * is used in file paths, so needs to not contain special characters. */
+  g_autofree gchar *name = g_compute_checksum_for_string (G_CHECKSUM_MD5, uri, -1);
+  g_autofree gchar *group = g_strdup_printf ("[remote \"%s\"]", name);
+  remote = ostree_remote_new (name, group);
 
   g_key_file_set_string (remote->options, remote->group, "url", uri);
   g_key_file_set_boolean (remote->options, remote->group, "gpg-verify", TRUE);

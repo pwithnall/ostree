@@ -150,24 +150,28 @@ _ostree_repo_get_remote_inherited (OstreeRepo  *self,
   return g_steal_pointer (&remote);
 }
 
-void
+gboolean
 _ostree_repo_add_remote (OstreeRepo   *self,
                          OstreeRemote *remote)
 {
-  g_return_if_fail (self != NULL);
-  g_return_if_fail (remote != NULL);
-  g_return_if_fail (remote->name != NULL);
+  gboolean already_existed;
+
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (remote != NULL, FALSE);
+  g_return_val_if_fail (remote->name != NULL, FALSE);
 
   g_mutex_lock (&self->remotes_lock);
 
-  g_hash_table_replace (self->remotes, remote->name, ostree_remote_ref (remote));
+  already_existed = g_hash_table_replace (self->remotes, remote->name, ostree_remote_ref (remote));
 
   g_mutex_unlock (&self->remotes_lock);
+
+  return already_existed;
 }
 
-static gboolean
-ost_repo_remove_remote (OstreeRepo   *self,
-                        OstreeRemote *remote)
+gboolean
+_ostree_repo_remove_remote (OstreeRepo   *self,
+                            OstreeRemote *remote)
 {
   gboolean removed;
 
@@ -882,10 +886,8 @@ impl_repo_remote_add (OstreeRepo     *self,
                          name, remote->file ? gs_file_get_path_cached (remote->file) : "(in config)");
     }
 
-  remote = ostree_remote_new ();
-  remote->name = g_strdup (name);
-  remote->group = g_strdup_printf ("remote \"%s\"", name);
-  remote->keyring = g_strdup_printf ("%s.trustedkeys.gpg", name);
+  g_autofree gchar *group = g_strdup_printf ("remote \"%s\"", name);
+  remote = ostree_remote_new (name, group);
 
   /* The OstreeRepo maintains its own internal system root path,
    * so we need to not only check if a "sysroot" argument was given
@@ -1039,7 +1041,7 @@ impl_repo_remote_delete (OstreeRepo     *self,
   if (!ot_ensure_unlinked_at (self->repo_dir_fd, remote->keyring, error))
     return FALSE;
 
-  ost_repo_remove_remote (self, remote);
+  _ostree_repo_remove_remote (self, remote);
 
   return TRUE;
 }

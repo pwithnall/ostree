@@ -99,7 +99,7 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
 {
   OstreeRepoFinderMount *self = OSTREE_REPO_FINDER_MOUNT (finder);
   g_autoptr(GTask) task = NULL;
-  g_autoptr(ObjectList) volumes = NULL;
+  g_autoptr(ObjectList) mounts = NULL;
   g_autoptr(GPtrArray) results = NULL;
   GList *l;
   const gint priority = 50;  /* arbitrarily chosen */
@@ -107,15 +107,15 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
   task = g_task_new (finder, cancellable, callback, user_data);
   g_task_set_source_tag (task, ostree_repo_finder_mount_resolve_async);
 
-  volumes = g_volume_monitor_get_volumes (self->monitor);
+  mounts = g_volume_monitor_get_mounts (self->monitor);
   results = g_ptr_array_new_with_free_func ((GDestroyNotify) ostree_repo_finder_result_free);
 
-  for (l = volumes; l != NULL; l = l->next)
+  g_debug ("%s: Found %u mounts", G_STRFUNC, g_list_length (mounts));
+
+  for (l = mounts; l != NULL; l = l->next)
     {
-      GVolume *volume = G_VOLUME (l->data);
-      g_autoptr(GDrive) drive = NULL;
-      g_autoptr(GMount) mount = NULL;
-      g_autofree gchar *volume_name = NULL;
+      GMount *mount = G_MOUNT (l->data);
+      g_autofree gchar *mount_name = NULL;
       g_autoptr(GFile) mount_root = NULL;
       g_autofree gchar *mount_root_path = NULL;
       glnx_fd_close int mount_root_dfd = -1;
@@ -128,26 +128,14 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
       const gchar *repo_uri;
       g_autoptr(GError) local_error = NULL;
 
-      drive = g_volume_get_drive (volume);
-      mount = g_volume_get_mount (volume);
-      volume_name = g_volume_get_name (volume);
+      mount_name = g_mount_get_name (mount);
 
-      /* Check the drive’s general properties. */
-      if (drive == NULL || mount == NULL)
+      /* Check the mount’s general properties. */
+      if (g_mount_is_shadowed (mount))
         {
-          g_debug ("Ignoring volume ‘%s’ due to NULL drive or mount.",
-                   volume_name);
+          g_debug ("Ignoring mount ‘%s’ as it’s shadowed.", mount_name);
           continue;
         }
-
-#if GLIB_CHECK_VERSION(2, 50, 0)
-      if (!g_drive_is_removable (drive))
-        {
-          g_debug ("Ignoring volume ‘%s’ as drive is not removable.",
-                   volume_name);
-          continue;
-        }
-#endif
 
       /* Check if it contains a .ostree/repos directory. */
       mount_root = g_mount_get_root (mount);
@@ -155,19 +143,19 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
 
       if (!glnx_opendirat (AT_FDCWD, mount_root_path, TRUE, &mount_root_dfd, &local_error))
         {
-          g_debug ("Ignoring volume ‘%s’ as ‘%s’ directory can’t be opened: %s",
-                   volume_name, mount_root_path, local_error->message);
+          g_debug ("Ignoring mount ‘%s’ as ‘%s’ directory can’t be opened: %s",
+                   mount_name, mount_root_path, local_error->message);
           continue;
         }
 
       if (!glnx_opendirat (mount_root_dfd, ".ostree/repos", TRUE, &repos_dfd, &local_error))
         {
           if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
-            g_debug ("Ignoring volume ‘%s’ as ‘%s/.ostree/repos’ directory doesn’t exist.",
-                     volume_name, mount_root_path);
+            g_debug ("Ignoring mount ‘%s’ as ‘%s/.ostree/repos’ directory doesn’t exist.",
+                     mount_name, mount_root_path);
           else
-            g_debug ("Ignoring volume ‘%s’ as ‘%s/.ostree/repos’ directory can’t be opened: %s",
-                     volume_name, mount_root_path, local_error->message);
+            g_debug ("Ignoring mount ‘%s’ as ‘%s/.ostree/repos’ directory can’t be opened: %s",
+                     mount_name, mount_root_path, local_error->message);
 
           continue;
         }
@@ -177,8 +165,8 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
        * symlinks for them pointing outside the mount root). */
       if (!glnx_fstat (mount_root_dfd, &mount_root_stbuf, &local_error))
         {
-          g_debug ("Ignoring volume ‘%s’ as querying info of ‘%s’ failed: %s",
-                   volume_name, mount_root_path, local_error->message);
+          g_debug ("Ignoring mount ‘%s’ as querying info of ‘%s’ failed: %s",
+                   mount_name, mount_root_path, local_error->message);
           continue;
         }
 
@@ -186,7 +174,7 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
        * for. If so, and it’s a symbolic link, dereference it so multiple links
        * to the same repository (containing multiple refs) are coalesced.
        * Otherwise, include it as a result by itself. */
-      repo_uri_to_refs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_ptr_array_unref);
+      repo_uri_to_refs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_hash_table_unref);
 
       for (i = 0; refs[i] != NULL; i++)
         {
@@ -199,16 +187,16 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
 
           if (!glnx_fstatat (repos_dfd, refs[i], &stbuf, AT_NO_AUTOMOUNT, &local_error))
             {
-              g_debug ("Ignoring ref ‘%s’ on volume ‘%s’ as querying info of ‘%s’ failed: %s",
-                       refs[i], volume_name, repo_dir_path, local_error->message);
+              g_debug ("Ignoring ref ‘%s’ on mount ‘%s’ as querying info of ‘%s’ failed: %s",
+                       refs[i], mount_name, repo_dir_path, local_error->message);
               g_clear_error (&local_error);
               continue;
             }
 
           if ((stbuf.st_mode & S_IFMT) != S_IFDIR)
             {
-              g_debug ("Ignoring ref ‘%s’ on volume ‘%s’ as ‘%s’ is of type %u, not a directory.",
-                       refs[i], volume_name, repo_dir_path, (stbuf.st_mode & S_IFMT));
+              g_debug ("Ignoring ref ‘%s’ on mount ‘%s’ as ‘%s’ is of type %u, not a directory.",
+                       refs[i], mount_name, repo_dir_path, (stbuf.st_mode & S_IFMT));
               continue;
             }
 
@@ -217,8 +205,8 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
            * volume. */
           if (stbuf.st_dev != mount_root_stbuf.st_dev)
             {
-              g_debug ("Ignoring ref ‘%s’ on volume ‘%s’ as it’s on a different file system from the mount.",
-                       refs[i], volume_name);
+              g_debug ("Ignoring ref ‘%s’ on mount ‘%s’ as it’s on a different file system from the mount.",
+                       refs[i], mount_name);
               continue;
             }
 
@@ -227,8 +215,8 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
            * the canonicalised repository URI to deduplicate the results. */
           canonical_repo_dir_path = realpath (repo_dir_path, NULL);
           resolved_repo_uri = g_strconcat ("file://", canonical_repo_dir_path, NULL);
-          g_debug ("Resolved ref ‘%s’ on volume ‘%s’ to repo URI ‘%s’.",
-                   refs[i], volume_name, resolved_repo_uri);
+          g_debug ("Resolved ref ‘%s’ on mount ‘%s’ to repo URI ‘%s’.",
+                   refs[i], mount_name, resolved_repo_uri);
 
           supported_ref_to_checksum = g_hash_table_lookup (repo_uri_to_refs, resolved_repo_uri);
 
@@ -248,12 +236,11 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder    *finder,
         {
           g_autoptr(OstreeRemote) remote = NULL;
 
-          remote = ostree_remote_new ();
-          remote->name = g_strdup (repo_uri);
-          remote->group = g_strdup_printf ("remote \"%s\"", remote->name);
-          remote->keyring = NULL;
-          remote->file = NULL;
-          remote->options = g_key_file_new ();
+          /* Build an #OstreeRemote. Use the hash of the URI, since remote->name
+           * is used in file paths, so needs to not contain special characters. */
+          g_autofree gchar *name = g_compute_checksum_for_string (G_CHECKSUM_MD5, repo_uri, -1);
+          g_autofree gchar *group = g_strdup_printf ("remote \"%s\"", name);
+          remote = ostree_remote_new (name, group);
 
           g_key_file_set_string (remote->options, remote->group, "url", repo_uri);
           g_key_file_set_boolean (remote->options, remote->group, "gpg-verify", TRUE);
