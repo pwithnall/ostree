@@ -588,7 +588,8 @@ complete_all_pending_tasks (OstreeRepoFinderAvahi *self)
           g_autoptr(OstreeRepoFinderResult) result = NULL;
 
           result = ostree_avahi_service_build_repo_finder_result (service, self, priority, refs);
-          g_ptr_array_add (results, g_steal_pointer (&result));
+          if (result != NULL)
+            g_ptr_array_add (results, g_steal_pointer (&result));
         }
 
       g_task_return_pointer (task, g_steal_pointer (&results), (GDestroyNotify) g_ptr_array_unref);
