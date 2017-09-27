@@ -92,6 +92,9 @@ G_DEFINE_TYPE_WITH_CODE (OstreeRepoFinderMount, ostree_repo_finder_mount, G_TYPE
 
 typedef struct
 {
+  /* @uri is essentially a cache of the realpath() lookup we’ve done on the
+   * return value of ostree_repo_get_path(repo). */
+  OstreeRepo *repo;  /* (owned) */
   gchar *uri;
   OstreeRemote *keyring_remote;  /* (owned) */
 } UriAndKeyring;
@@ -99,6 +102,7 @@ typedef struct
 static void
 uri_and_keyring_free (UriAndKeyring *data)
 {
+  g_clear_object (&data->repo);
   g_free (data->uri);
   ostree_remote_unref (data->keyring_remote);
   g_free (data);
@@ -107,12 +111,14 @@ uri_and_keyring_free (UriAndKeyring *data)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (UriAndKeyring, uri_and_keyring_free)
 
 static UriAndKeyring *
-uri_and_keyring_new (const gchar  *uri,
+uri_and_keyring_new (OstreeRepo   *repo,
+                     const gchar  *uri,
                      OstreeRemote *keyring_remote)
 {
   g_autoptr(UriAndKeyring) data = NULL;
 
   data = g_new0 (UriAndKeyring, 1);
+  data->repo = g_object_ref (repo);
   data->uri = g_strdup (uri);
   data->keyring_remote = ostree_remote_ref (keyring_remote);
 
@@ -124,7 +130,7 @@ uri_and_keyring_hash (gconstpointer key)
 {
   const UriAndKeyring *_key = key;
 
-  return g_str_hash (_key->uri) ^ g_str_hash (_key->keyring_remote->keyring);
+  return ostree_repo_hash (_key->repo) ^ g_str_hash (_key->keyring_remote->keyring);
 }
 
 static gboolean
@@ -133,7 +139,7 @@ uri_and_keyring_equal (gconstpointer a,
 {
   const UriAndKeyring *_a = a, *_b = b;
 
-  return (g_str_equal (_a->uri, _b->uri) &&
+  return (ostree_repo_equal (_a->repo, _b->repo) &&
           g_str_equal (_a->keyring_remote->keyring, _b->keyring_remote->keyring));
 }
 
@@ -447,7 +453,8 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder                  *finde
               const RepoAndRefs *repo_and_refs = &g_array_index (repos_refs, RepoAndRefs, j);
               OstreeRepo *repo = repo_and_refs->repo;
               GHashTable *repo_refs = repo_and_refs->refs;
-              g_autofree char *repo_path = g_file_get_path (ostree_repo_get_path (repo));
+              g_autofree char *_repo_path = g_file_get_path (ostree_repo_get_path (repo));
+              g_autofree char *repo_path = realpath (_repo_path, NULL);
               g_autoptr(OstreeRemote) keyring_remote = NULL;
 
               const gchar *checksum = g_hash_table_lookup (repo_refs, ref);
@@ -477,13 +484,12 @@ ostree_repo_finder_mount_resolve_async (OstreeRepoFinder                  *finde
                * $mount_root/.ostree/repos.d/$something.
                * Add it to the results, keyed by the canonicalised repository URI
                * to deduplicate the results. */
-              g_autofree char *canonical_repo_path = realpath (repo_path, NULL);
-              resolved_repo_uri = g_strconcat ("file://", canonical_repo_path, NULL);
+              resolved_repo_uri = g_strconcat ("file://", repo_path, NULL);
               g_debug ("Resolved ref (%s, %s) on mount ‘%s’ to repo URI ‘%s’ with keyring ‘%s’ from remote ‘%s’.",
                        ref->collection_id, ref->ref_name, mount_name, resolved_repo_uri,
                        keyring_remote->keyring, keyring_remote->name);
 
-              resolved_repo = uri_and_keyring_new (resolved_repo_uri, keyring_remote);
+              resolved_repo = uri_and_keyring_new (repo, resolved_repo_uri, keyring_remote);
 
               supported_ref_to_checksum = g_hash_table_lookup (repo_to_refs, resolved_repo);
 
