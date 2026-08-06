@@ -194,6 +194,23 @@ test_signature_lookup (TestFixture *fixture, gconstpointer user_data)
       = ostree_gpg_verify_result_lookup (fixture->result, fingerprint, &signature_index);
   g_assert_false (signature_found);
   g_assert_cmpint (signature_index, ==, expected_signature_index);
+
+  /* Lookup full fingerprint by subkey. */
+  expected_signature_index = 2;
+  signature_index = 999999;
+  fingerprint = "68dcc2db4bec5811c2573590bd9d2a44b7f541a6!";
+  signature_found
+      = ostree_gpg_verify_result_lookup (fixture->result, fingerprint, &signature_index);
+  g_assert_true (signature_found);
+  g_assert_cmpint (signature_index, ==, expected_signature_index);
+
+  /* Can’t abbreviate key IDs when asking for a subkey match. */
+  signature_index = expected_signature_index = 999999;
+  fingerprint = "bd9d2a44b7f541a6!";
+  signature_found
+      = ostree_gpg_verify_result_lookup (fixture->result, fingerprint, &signature_index);
+  g_assert_false (signature_found);
+  g_assert_cmpint (signature_index, ==, expected_signature_index);
 }
 
 static void
